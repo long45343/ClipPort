@@ -1,0 +1,13 @@
+# Build outputs
+bin/
+obj/
+build/
+dist/
+out/
+*.apk.idsig
+.gradle/
+local.properties
+*.jks
+*.keystore
+keystore.properties
+.DS_Store
