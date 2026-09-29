@@ -36,6 +36,10 @@ class ClipPortService : Service() {
         m.connect(pinned = false)
     }
 
+    fun requestDiscovery() {
+        manager?.startAutoDiscover()
+    }
+
     fun requestConnect() {
         manager?.connect(pinned = Prefs(this).serverFpHex != null)
     }

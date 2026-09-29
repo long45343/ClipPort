@@ -10,6 +10,7 @@ import com.clipport.app.clip.DedupeWindow
 import com.clipport.app.clip.MimeUtil
 import com.clipport.app.clip.RemoteClipApplier
 import com.clipport.app.protocol.*
+import com.clipport.app.transport.PcDiscovery
 import com.clipport.app.transport.PcLink
 import java.security.MessageDigest
 
@@ -200,6 +201,22 @@ class SyncManager(
         if (reconnectScheduled) return
         reconnectScheduled = true
         handler.postDelayed({ reconnectScheduled = false; connect(pinned = prefs.serverFpHex != null) }, 3000)
+    }
+
+    /** BLE 自动发现 PC（D-02）：扫描广播回填 IP 后连接；BLE 不可用返回 false 走手动兜底。 */
+    fun startAutoDiscover(): Boolean {
+        status("正在通过 BLE 发现 PC…")
+        PcDiscovery.onFound = { ip, port ->
+            handler.post {
+                prefs.host = ip
+                prefs.port = port
+                status("发现 PC: $ip:$port，连接中…")
+                connect(pinned = prefs.serverFpHex != null)
+            }
+        }
+        val ok = PcDiscovery.start(prefs.serverFpHex)
+        if (!ok) status("BLE 不可用（权限/硬件），请手动填写 IP")
+        return ok
     }
 
     /** 连接 PC。pairing=true 信任任意证书并发送配对请求。 */

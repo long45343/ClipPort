@@ -1,6 +1,7 @@
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using ClipPort.Core.Net;
+using System.Net;
 using ClipPort.Core.Sync;
 using ClipPort.Core.Clipboard;
 
@@ -25,6 +26,21 @@ public partial class App : Application
     }
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
+    {
+        try
+        {
+            OnLaunchedInner(args);
+        }
+        catch (Exception ex)
+        {
+            System.IO.File.WriteAllText(
+                System.IO.Path.Combine(ClipPort.Core.Net.CertManager.StoreDir, "startup-crash.log"),
+                ex.ToString());
+            throw;
+        }
+    }
+
+    private void OnLaunchedInner(LaunchActivatedEventArgs args)
     {
         // 单实例互斥（spec §4）：防止新旧实例托盘图标并存造成"点了没反应"的假象
         _singleInstance = new Mutex(true, "ClipPort.SingleInstance", out var createdNew);
@@ -83,7 +99,13 @@ public partial class App : Application
             var cert = CertManager.GetOrCreate();
             Server!.Start(Config.TcpPort, cert);
             Config.PairingCodeHash = null;
-            OnEngineLog($"server listening on :{Config.TcpPort} fp={Convert.ToHexString(CertManager.Fingerprint(cert))[..12]}…");
+            var fp = CertManager.Fingerprint(cert);
+            // BLE 常驻广播（D-02）：手机扫描后自动回填 IP 连入，无需手动输入
+            try { BlePublisher.Start(Config.TcpPort, fp); } catch (Exception ex) { OnEngineLog("ble 广播不可用: " + ex.Message); }
+            var ips = BlePublisher.AllLanIpv4().Select(a => a.ToString()).ToList();
+            var addrText = string.Join("  ", ips.Select(ip => $"{ip}:{Config.TcpPort}"));
+            OnEngineLog($"本机地址: {addrText}（手机自动发现中，也可手动填写）");
+            UiQueue.TryEnqueue(() => _main?.SetLocalIp(addrText));
         }
         catch (Exception ex) { OnEngineLog("server start failed: " + ex.Message); }
     }
@@ -95,26 +117,6 @@ public partial class App : Application
         Config.PairingOpen = true;
         Config.Save();
         // 手机在配对成功后广播 BLE；PC 侧 v1 由手机直连 IP 完成配对
-    }
-
-    public void CommitPairing(string phoneName)
-    {
-        Config.PairedPhoneName = phoneName;
-        Config.Save();
-        OnStatus($"paired: {phoneName}");
-        StartBleWatcher();
-    }
-
-    public void StartBleWatcher()
-    {
-        try
-        {
-            var fp = CertManager.Fingerprint(CertManager.GetOrCreate());
-            var watcher = new BleWatcher(fp);
-            watcher.EndpointFound += ep => OnEngineLog($"ble peer {ep.Ip}:{ep.Port}");
-            watcher.Start();
-        }
-        catch (Exception ex) { OnEngineLog("ble unavailable: " + ex.Message); }
     }
 
     private void OnEngineLog(string msg) => UiQueue.TryEnqueue(() => _main?.AppendLog(msg));

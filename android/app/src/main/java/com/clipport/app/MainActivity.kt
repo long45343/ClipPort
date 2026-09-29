@@ -48,6 +48,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         host = prefs.host ?: ""
+        // 首次进入自动尝试发现（已配对过的设备免一切输入）
         port = prefs.port.toString()
         clearMinutes = (prefs.clearMs / 60000).toString()
         syncEnabled = prefs.syncEnabled
@@ -95,13 +96,20 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Button(onClick = { saveAndPair() }, enabled = host.isNotBlank() && code.length == 6) {
+                    Button(onClick = { saveAndPair() }, enabled = code.length == 6) {
                         Text(if (paired) "重新配对" else "配对")
                     }
                     Button(onClick = { saveAndConnect() }, enabled = host.isNotBlank()) {
                         Text("连接")
                     }
+                    Button(onClick = { autoDiscover() }) {
+                        Text("自动发现")
+                    }
                 }
+                Text(
+                    "同一 WiFi 下可点「自动发现」免填 IP（BLE 广播发现）；跨网段时手动填 PC 界面显示的地址。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 HorizontalDivider()
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                     Text("剪贴板同步")
@@ -127,6 +135,21 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    private fun autoDiscover() {
+        // Android 12+ 需要 BLUETOOTH_SCAN；29~30 需要定位权限
+        if (Build.VERSION.SDK_INT >= 31) {
+            scanPerm.launch(Manifest.permission.BLUETOOTH_SCAN)
+        } else {
+            scanPerm.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        status = "发现中…"
+        ClipPortService.instance?.requestDiscovery()
+    }
+
+    private val scanPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) status = "未授予扫描权限，请手动填写 IP"
     }
 
     private fun saveAndPair() {

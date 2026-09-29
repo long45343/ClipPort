@@ -27,6 +27,8 @@ public sealed partial class MainWindow : Window
 
     public void SetStatus(string s) => StatusText.Text = s;
 
+    public void SetLocalIp(string s) => LocalIpText.Text = "本机地址: " + s;
+
     public void AppendLog(string msg)
     {
         LogList.Items.Add($"[{DateTime.Now:HH:mm:ss}] {msg}");
