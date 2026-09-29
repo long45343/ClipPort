@@ -1,0 +1,239 @@
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+using ClipPort.Core.Protocol;
+
+namespace ClipPort.Core.Net;
+
+/// <summary>
+/// TLS(TcpListener+SslStream) 服务端（D-01/D-03）。
+/// 职责：接受手机连接、完成 HELLO/PAIR、收发帧、心跳。
+/// 帧回调在每连接读线程触发；发送方通过 Send 广播。
+/// </summary>
+public sealed class TlsLinkServer : IAsyncDisposable
+{
+    private TcpListener? _listener;
+    private X509Certificate2? _cert;
+    private readonly List<PhoneLink> _links = new();
+    private readonly object _gate = new();
+    private CancellationTokenSource? _cts;
+    private uint _seq;
+
+    public Func<Hello, bool>? OnHello { get; set; }            // 返回是否接受该设备
+    public Func<byte[], bool>? OnPairRequest { get; set; }     // 入参 codeHash，返回是否配对成功
+    public Action<ClipBroadcast>? OnBroadcast { get; set; }
+    public Func<TextRequest, TextResponse>? OnTextRequest { get; set; }
+    public Action<string>? Log { get; set; }
+
+    public bool HasConnectedPhone => _links.Count > 0;
+    public PhoneLink? PrimaryLink { get { lock (_gate) return _links.FirstOrDefault(l => l.Alive && l.Paired); } }
+
+    public void Start(ushort port, X509Certificate2 cert)
+    {
+        _cert = cert;
+        _cts = new CancellationTokenSource();
+        _listener = new TcpListener(IPAddress.Any, port);
+        _listener.Start();
+        _ = Task.Run(() => AcceptLoop(_cts.Token));
+        _ = Task.Run(() => PingLoop(_cts.Token));
+    }
+
+    private async Task AcceptLoop(CancellationToken ct)
+    {
+        var listener = _listener!;
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try { client = await listener.AcceptTcpClientAsync(ct); }
+            catch (OperationCanceledException) { break; }
+            catch (SocketException) { continue; }
+            _ = Task.Run(() => ServeClient(client, ct), ct);
+        }
+    }
+
+    private async Task ServeClient(TcpClient client, CancellationToken ct)
+    {
+        var link = new PhoneLink(this, client);
+        try
+        {
+            await link.HandshakeAsync(_cert!, ct);
+            lock (_gate) { _links.RemoveAll(l => !l.Alive); _links.Add(link); }
+            OnHello?.Invoke(link.PeerHello);
+            await link.ReadLoop(ct);   // 阻塞直到断开
+        }
+        catch (Exception ex) { Log?.Invoke($"link error: {ex.Message}"); }
+        finally
+        {
+            lock (_gate) _links.Remove(link);
+            link.Dispose();
+        }
+    }
+
+    private async Task PingLoop(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(30_000, ct); } catch { break; }
+            SendToAll(FrameCodec.Encode(FrameCodec.Ping, NextSeq(), Array.Empty<byte>()));
+        }
+    }
+
+    public uint NextSeq() => Interlocked.Increment(ref _seq);
+
+    public void SendToAll(byte[] frame)
+    {
+        lock (_gate)
+        {
+            foreach (var l in _links.Where(l => l.Alive && l.Paired).ToList())
+                _ = l.SendAsync(frame);
+        }
+    }
+
+    public bool HandlePairOnCurrentLink(byte[] codeHash)
+    {
+        PhoneLink? pending;
+        lock (_gate) pending = _links.FirstOrDefault(l => l.Alive && !l.Paired);
+        if (pending is null) return false;
+        pending.Paired = true;
+        return true;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts?.Cancel();
+        try { _listener?.Stop(); } catch { }
+        lock (_gate) { foreach (var l in _links) l.Dispose(); _links.Clear(); }
+        await Task.CompletedTask;
+    }
+
+    public sealed class PhoneLink : IDisposable
+    {
+        private readonly TcpClient _tcp;
+        private readonly TlsLinkServer _owner;
+        private SslStream? _ssl;
+        private readonly SemaphoreSlim _sendGate = new(1, 1);
+        private readonly Dictionary<uint, TaskCompletionSource<TextResponse>> _pending = new();
+        public Hello PeerHello { get; private set; } = new();
+        public volatile bool Paired;
+        public bool Alive => _tcp.Connected && _ssl is { };
+
+        public PhoneLink(TlsLinkServer owner, TcpClient tcp) { _owner = owner; _tcp = tcp; }
+
+        public async Task HandshakeAsync(X509Certificate2 cert, CancellationToken ct)
+        {
+            var raw = _tcp.GetStream();
+            _ssl = new SslStream(raw, false);
+            await _ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+            {
+                ServerCertificate = cert,
+                EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls13 | System.Security.Authentication.SslProtocols.Tls12,
+            }, ct);
+        }
+
+        public async Task ReadLoop(CancellationToken ct)
+        {
+            var buf = new byte[256 * 1024];
+            var acc = new MemoryStream();
+            while (!ct.IsCancellationRequested && Alive)
+            {
+                int n = await _ssl!.ReadAsync(buf, ct);
+                if (n <= 0) break;
+                acc.Position = acc.Length;
+                foreach (var b in buf.AsSpan(0, n)) acc.WriteByte(b);
+                ParseFrames(acc);
+            }
+        }
+
+        private void ParseFrames(MemoryStream acc)
+        {
+            var buf = acc.GetBuffer().AsSpan(0, (int)acc.Length);
+            int consumed = 0;
+            while (FrameCodec.TryDecode(buf.Slice(consumed), out var type, out var seq, out var payload, out var used))
+            {
+                consumed += used;
+                Dispatch(type, seq, payload);
+            }
+            if (consumed > 0)
+            {
+                var rest = buf.Slice(consumed).ToArray();
+                acc.SetLength(0);
+                acc.Write(rest);
+                acc.Position = 0;
+            }
+        }
+
+        private void Dispatch(byte type, uint seq, byte[] payload)
+        {
+            switch (type)
+            {
+                case FrameCodec.Pong: break;
+                case FrameCodec.Ping:
+                    _ = SendAsync(FrameCodec.Encode(FrameCodec.Pong, seq, payload));
+                    break;
+                case FrameCodec.Hello:
+                    PeerHello = Hello.Decode(payload);
+                    break;
+                case FrameCodec.PairReq:
+                    bool ok = _owner.OnPairRequest?.Invoke(payload) ?? false;
+                    _ = SendAsync(FrameCodec.Encode(FrameCodec.PairOk, seq,
+                        Pairing.EncodePairOk(ok, _owner._cert != null ? CertManager.Fingerprint(_owner._cert) : Array.Empty<byte>())));
+                    break;
+                case FrameCodec.ClipBroadcast:
+                    _owner.OnBroadcast?.Invoke(ClipBroadcast.Decode(payload));
+                    break;
+                case FrameCodec.RespText:
+                {
+                    var resp = TextResponse.Decode(payload);
+                    TaskCompletionSource<TextResponse>? tcs;
+                    lock (_pending)
+                    {
+                        if (_pending.Remove(resp.Seq, out tcs)) tcs.TrySetResult(resp);
+                    }
+                    break;
+                }
+                case FrameCodec.ReqText:
+                    var resp2 = _owner.OnTextRequest?.Invoke(TextRequest.Decode(payload))
+                               ?? new TextResponse { Status = 1 };
+                    _ = SendAsync(FrameCodec.Encode(FrameCodec.RespText, seq, resp2.Encode()));
+                    break;
+            }
+        }
+
+        /// <summary>向手机发送 REQ_TEXT 并等待 RESP_TEXT（服务端主动请求，seq 作关联 ID）。</summary>
+        public async Task<TextResponse> RequestTextAsync(TextRequest req, CancellationToken ct)
+        {
+            uint rid = _owner.NextSeq();
+            var tcs = new TaskCompletionSource<TextResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_pending) _pending[rid] = tcs;
+            try
+            {
+                await SendAsync(FrameCodec.Encode(FrameCodec.ReqText, rid, req.Encode()));
+                var done = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(15), ct));
+                if (done != tcs.Task) throw new TimeoutException("resp_text timeout");
+                return tcs.Task.Result;
+            }
+            finally
+            {
+                lock (_pending) _pending.Remove(rid);
+            }
+        }
+
+        public async Task SendAsync(byte[] frame)
+        {
+            var ssl = _ssl;
+            if (ssl is null) return;
+            await _sendGate.WaitAsync();
+            try { await ssl.WriteAsync(frame); await ssl.FlushAsync(); }
+            catch { _tcp.Close(); }
+            finally { _sendGate.Release(); }
+        }
+
+        public void Dispose()
+        {
+            try { _tcp.Close(); } catch { }
+            _ssl?.Dispose();
+            _sendGate.Dispose();
+        }
+    }
+}

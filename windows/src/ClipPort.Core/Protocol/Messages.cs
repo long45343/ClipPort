@@ -1,0 +1,268 @@
+using System.Text;
+
+namespace ClipPort.Core.Protocol;
+
+public static class Mime
+{
+    public const uint Text = 0;
+    public const uint Html = 1;
+    public const uint BothTextHtml = 2;
+    public const uint ImagePng = 3;
+    public const uint File = 4;
+}
+
+/// <summary>CLIP_BROADCAST 负载：ClipBroadcast（docs/03-protocol-spec.md §3）。</summary>
+public sealed class ClipBroadcast
+{
+    public byte[] DeviceId = Array.Empty<byte>();
+    public uint Seq;
+    public bool NeedChannel;
+    public List<uint> MimeCodes = new();
+    public ClipInline? Inline;
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>(64);
+        Proto.WriteBytes(o, 1, DeviceId);
+        Proto.WriteUint(o, 2, Seq);
+        Proto.WriteBool(o, 3, NeedChannel);
+        foreach (var m in MimeCodes) Proto.WriteUint(o, 4, m);
+        if (Inline != null) Proto.WriteMessage(o, 5, Inline.Encode());
+        return o.ToArray();
+    }
+
+    public static ClipBroadcast Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new ClipBroadcast();
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f)
+            {
+                case 1: m.DeviceId = r.ReadBytes(); break;
+                case 2: m.Seq = r.ReadUint32(); break;
+                case 3: m.NeedChannel = r.ReadBool(); break;
+                case 4: m.MimeCodes.Add(r.ReadUint32()); break;
+                case 5: m.Inline = ClipInline.Decode(r.ReadRawMessage()); break;
+                default: r.Skip(wt); break;
+            }
+        }
+        return m;
+    }
+}
+
+public sealed class ClipInline
+{
+    public string? Text;
+    public string? Html;
+    public byte[]? ImagePng;
+    public List<InlineItem> Items = new();
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>();
+        Proto.WriteString(o, 1, Text);
+        Proto.WriteString(o, 2, Html);
+        Proto.WriteBytes(o, 3, ImagePng);
+        foreach (var it in Items) Proto.WriteMessage(o, 4, it.Encode());
+        return o.ToArray();
+    }
+
+    public static ClipInline Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new ClipInline();
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f)
+            {
+                case 1: m.Text = r.ReadString(); break;
+                case 2: m.Html = r.ReadString(); break;
+                case 3: m.ImagePng = r.ReadBytes(); break;
+                case 4: m.Items.Add(InlineItem.Decode(r.ReadRawMessage())); break;
+                default: r.Skip(wt); break;
+            }
+        }
+        return m;
+    }
+}
+
+public sealed class InlineItem
+{
+    public uint Index;
+    public uint Mime;
+    public string? Text;
+    public string? Html;
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>();
+        Proto.WriteUint(o, 1, Index);
+        Proto.WriteUint(o, 2, Mime);
+        Proto.WriteString(o, 3, Text);
+        Proto.WriteString(o, 4, Html);
+        return o.ToArray();
+    }
+
+    public static InlineItem Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new InlineItem();
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f)
+            {
+                case 1: m.Index = r.ReadUint32(); break;
+                case 2: m.Mime = r.ReadUint32(); break;
+                case 3: m.Text = r.ReadString(); break;
+                case 4: m.Html = r.ReadString(); break;
+                default: r.Skip(wt); break;
+            }
+        }
+        return m;
+    }
+}
+
+/// <summary>HELLO：设备名(1) 设备类型(2: 0=pc,1=phone) 协议版本(3) 设备ID(4)。</summary>
+public sealed class Hello
+{
+    public string Name = "";
+    public int DeviceType;
+    public int ProtoVer = 1;
+    public byte[] DeviceId = Array.Empty<byte>();
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>();
+        Proto.WriteString(o, 1, Name);
+        Proto.WriteUint(o, 2, (uint)DeviceType);
+        Proto.WriteUint(o, 3, (uint)ProtoVer);
+        Proto.WriteBytes(o, 4, DeviceId);
+        return o.ToArray();
+    }
+
+    public static Hello Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new Hello();
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f)
+            {
+                case 1: m.Name = r.ReadString(); break;
+                case 2: m.DeviceType = (int)r.ReadUint32(); break;
+                case 3: m.ProtoVer = (int)r.ReadUint32(); break;
+                case 4: m.DeviceId = r.ReadBytes(); break;
+                default: r.Skip(wt); break;
+            }
+        }
+        return m;
+    }
+}
+
+/// <summary>PAIR_REQ{sha256(code)=1} / PAIR_OK{ok=1, cert_fp=2}。</summary>
+public static class Pairing
+{
+    public static byte[] EncodePairReq(byte[] codeHash)
+    {
+        var o = new List<byte>();
+        Proto.WriteBytes(o, 1, codeHash);
+        return o.ToArray();
+    }
+
+    public static byte[] DecodePairReq(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        while (r.ReadTag(out var f, out var wt))
+        {
+            if (f == 1) return r.ReadBytes();
+            r.Skip(wt);
+        }
+        return Array.Empty<byte>();
+    }
+
+    public static byte[] EncodePairOk(bool ok, byte[] certFp)
+    {
+        var o = new List<byte>();
+        Proto.WriteBool(o, 1, ok);
+        Proto.WriteBytes(o, 2, certFp);
+        return o.ToArray();
+    }
+
+    public static (bool Ok, byte[] Fp) DecodePairOk(byte[] payload)
+    {
+        bool ok = false; byte[] fp = Array.Empty<byte>();
+        var r = new Proto.Reader(payload);
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f) { case 1: ok = r.ReadBool(); break; case 2: fp = r.ReadBytes(); break; default: r.Skip(wt); break; }
+        }
+        return (ok, fp);
+    }
+}
+
+public sealed class TextRequest
+{
+    public uint Seq;
+    public uint ItemId;
+    public uint Mime;
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>();
+        Proto.WriteUint(o, 1, Seq);
+        Proto.WriteUint(o, 2, ItemId);
+        Proto.WriteUint(o, 3, Mime);
+        return o.ToArray();
+    }
+
+    public static TextRequest Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new TextRequest();
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f) { case 1: m.Seq = r.ReadUint32(); break; case 2: m.ItemId = r.ReadUint32(); break; case 3: m.Mime = r.ReadUint32(); break; default: r.Skip(wt); break; }
+        }
+        return m;
+    }
+}
+
+public sealed class TextResponse
+{
+    public uint Seq;
+    public uint ItemId;
+    public uint Mime;
+    public uint Status; // 0=ok 1=fail
+    public byte[] Content = Array.Empty<byte>();
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>();
+        Proto.WriteUint(o, 1, Seq);
+        Proto.WriteUint(o, 2, ItemId);
+        Proto.WriteUint(o, 3, Mime);
+        Proto.WriteUint(o, 4, Status);
+        Proto.WriteBytes(o, 5, Content);
+        return o.ToArray();
+    }
+
+    public static TextResponse Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new TextResponse();
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f)
+            {
+                case 1: m.Seq = r.ReadUint32(); break;
+                case 2: m.ItemId = r.ReadUint32(); break;
+                case 3: m.Mime = r.ReadUint32(); break;
+                case 4: m.Status = r.ReadUint32(); break;
+                case 5: m.Content = r.ReadBytes(); break;
+                default: r.Skip(wt); break;
+            }
+        }
+        return m;
+    }
+}
