@@ -33,6 +33,7 @@ public partial class App : Application
         Server.Log = OnEngineLog;
         _listener = new ClipboardListener();
         _listener.ClipChanged += () => Engine.OnLocalClipChanged();
+        _listener.Start();
 
         _tray = new TrayIcon();
         _tray.Click += ShowMain;
@@ -42,7 +43,9 @@ public partial class App : Application
 
         _main = new MainWindow();
         _main.Activate();
-        _main.HideToTray();
+        // 仅带 --minimized（开机自启）时收进托盘；正常启动保持窗口可见
+        if (Environment.GetCommandLineArgs().Any(a => a.Equals("--minimized", StringComparison.OrdinalIgnoreCase)))
+            _main.HideToTray();
     }
 
     private void StartServer()

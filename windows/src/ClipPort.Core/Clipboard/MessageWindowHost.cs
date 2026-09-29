@@ -25,7 +25,7 @@ public static class MessageWindowHost
             _pump = new Thread(() =>
             {
                 PumpReady.Set();
-                Pump.Run(Ops);
+                Pump.Run(Ops, () => PumpReady.Set());
             })
             { IsBackground = true, Name = "clipport-msgwnd" };
             _pump.Start();
@@ -37,7 +37,7 @@ public static class MessageWindowHost
     {
         EnsurePump();
         var tcs = new TaskCompletionSource<IntPtr>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Ops.Add(() =>
+        Enqueue(() =>
         {
             try { tcs.TrySetResult(CreateOnPumpThread(className, proc)); }
             catch (Exception ex) { tcs.TrySetException(ex); }
@@ -45,10 +45,17 @@ public static class MessageWindowHost
         return tcs.Task.GetAwaiter().GetResult();
     }
 
-    public static void DestroyWindow(IntPtr hwnd) => Ops.Add(() =>
+    public static void DestroyWindow(IntPtr hwnd) => Enqueue(() =>
     {
         try { if (hwnd != IntPtr.Zero) Native.DestroyWindow(hwnd); } catch { }
     });
+
+    /// <summary>入队并在泵线程唤醒执行（先入队再 Post，保证操作可见）。</summary>
+    private static void Enqueue(Action op)
+    {
+        Ops.Add(op);
+        Pump.Wake();
+    }
 
     private static IntPtr CreateOnPumpThread(string className, WndProc proc)
     {
@@ -72,8 +79,15 @@ public static class MessageWindowHost
     private static readonly List<WndProc> KeepAliveProcs = new();
 }
 
+/// <summary>
+/// 消息泵：常驻 GetMessageW 循环；队列操作经 PostThreadMessage(WM_APP_OP) 唤醒执行。
+/// 严禁在进入消息循环前阻塞等队列——那会让窗口消息永远得不到分发（托盘点击失灵的根因）。
+/// </summary>
 internal static class Pump
 {
+    private const uint WM_APP_OP = 0x8001; // WM_APP+1
+    private static volatile uint _threadId;
+
     [DllImport("user32.dll")]
     private static extern int GetMessageW(out Msg msg, IntPtr hwnd, uint min, uint max);
 
@@ -83,6 +97,12 @@ internal static class Pump
     [DllImport("user32.dll")]
     private static extern IntPtr DispatchMessageW(ref Msg msg);
 
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern bool PostThreadMessageW(uint threadId, uint msg, IntPtr wParam, IntPtr lParam);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct Msg
     {
@@ -90,19 +110,27 @@ internal static class Pump
         public uint time; public int ptX, ptY;
     }
 
-    public static void Run(BlockingCollection<Action> ops)
+    public static void Run(BlockingCollection<Action> ops, Action onThreadReady)
     {
-        // 先执行排队的窗口创建，再进入消息循环
-        while (ops.TryTake(out var op, Timeout.Infinite)) op();
-        // 消息循环中继续处理后续注册
-        _ = Task.Run(() =>
-        {
-            foreach (var op in ops.GetConsumingEnumerable()) op();
-        });
+        _threadId = GetCurrentThreadId();
+        onThreadReady();
         while (GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
-            _ = TranslateMessage(ref msg);
-            _ = DispatchMessageW(ref msg);
+            if (msg.message == WM_APP_OP && msg.hwnd == IntPtr.Zero)
+            {
+                while (ops.TryTake(out var op)) op();
+            }
+            else
+            {
+                _ = TranslateMessage(ref msg);
+                _ = DispatchMessageW(ref msg);
+            }
         }
+    }
+
+    public static void Wake()
+    {
+        var tid = _threadId;
+        if (tid != 0) PostThreadMessageW(tid, WM_APP_OP, IntPtr.Zero, IntPtr.Zero);
     }
 }
