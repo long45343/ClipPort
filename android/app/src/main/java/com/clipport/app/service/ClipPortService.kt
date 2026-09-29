@@ -104,10 +104,18 @@ class ClipPortService : Service() {
             .setContentIntent(tap)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(NOTIFICATION_ID, n)
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIFICATION_ID, n)
+            }
+        } catch (e: Exception) {
+            // 权限缺失（如未授 BLUETOOTH_CONNECT）时 Android 会拒绝 connectedDevice 类型前台服务：
+            // 降级为停止服务并提示，绝不让应用闪退
+            android.util.Log.w("ClipPortService", "startForeground failed", e)
+            statusText = "权限不足无法常驻，请打开应用授权"
+            stopSelf()
         }
     }
 }

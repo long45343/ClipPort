@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -31,7 +32,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.clipport.app.service.ClipPortService
 
-/** 主界面（D-12：Compose Material 3 设置页，兼作 Xposed 配置宿主）。 */
+/** 主界面（D-12：Compose Material 3 设置页，兼作 Xposed 配置宿主）。
+ *  权限门控启动：先申请运行时权限，全部落定后才启动前台服务（connectedDevice 类型
+ *  在 Android 12+ 要求已持有 BLUETOOTH_CONNECT，先斩后奏会 SecurityException 闪退）。 */
 class MainActivity : ComponentActivity() {
     private val prefs by lazy { Prefs(this) }
 
@@ -40,28 +43,69 @@ class MainActivity : ComponentActivity() {
     private var code by mutableStateOf("")
     private var clearMinutes by mutableStateOf("2")
     private var syncEnabled by mutableStateOf(true)
-    private var status by mutableStateOf("未连接")
+    private var status by mutableStateOf("初始化…")
     private var paired by mutableStateOf(false)
 
-    private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    /// 权限落定后要执行的续作：null=仅启动服务；"pair"=配对；"discover"=自动发现
+    private var pendingAction: String? = null
+
+    private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        val missing = grants.filterValues { !it }.keys.toList()
+        if (missing.isNotEmpty()) {
+            status = "权限不全：${missing.joinToString { shortName(it) }}，部分功能受限"
+            Log.w("MainActivity", "missing permissions: $missing")
+        }
+        when (pendingAction) {
+            "pair" -> { saveAndPair(); pendingAction = null }
+            "discover" -> { doAutoDiscover(); pendingAction = null }
+            else -> startServiceSafely()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         host = prefs.host ?: ""
-        // 首次进入自动尝试发现（已配对过的设备免一切输入）
         port = prefs.port.toString()
         clearMinutes = (prefs.clearMs / 60000).toString()
         syncEnabled = prefs.syncEnabled
         paired = prefs.serverFpHex != null
-        status = if (ClipPortService.running) ClipPortService.statusText else "服务未运行"
+        status = if (ClipPortService.running) ClipPortService.statusText else "申请权限中…"
 
-        if (Build.VERSION.SDK_INT >= 33) {
-            notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
-        // 前台服务启动（Android 12+ 需前台可启动——本 Activity 就是前台）
-        startForegroundService(Intent(this, ClipPortService::class.java).setAction(ClipPortService.ACTION_START))
-
+        requestEssentialPermissions(then = null)
         setContent { MaterialTheme { Screen() } }
+    }
+
+    /** 申请关键运行时权限；全部已持有时直接执行续作。 */
+    private fun requestEssentialPermissions(then: String?) {
+        pendingAction = then
+        val needed = buildList {
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+            if (Build.VERSION.SDK_INT >= 31) {
+                add(Manifest.permission.BLUETOOTH_CONNECT)
+                add(Manifest.permission.BLUETOOTH_SCAN)
+            } else {
+                add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }.filter { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
+
+        if (needed.isEmpty()) {
+            when (pendingAction) {
+                "pair" -> { saveAndPair(); pendingAction = null }
+                "discover" -> { doAutoDiscover(); pendingAction = null }
+                else -> startServiceSafely()
+            }
+        } else {
+            permLauncher.launch(needed.toTypedArray())
+        }
+    }
+
+    private fun startServiceSafely() {
+        try {
+            startForegroundService(Intent(this, ClipPortService::class.java).setAction(ClipPortService.ACTION_START))
+        } catch (e: Exception) {
+            Log.w("MainActivity", "start service failed", e)
+            status = "服务启动失败：${e.message}"
+        }
     }
 
     @Composable
@@ -82,7 +126,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 OutlinedTextField(
                     value = host, onValueChange = { host = it },
-                    label = { Text("PC 地址 (IP)") }, modifier = Modifier.fillMaxWidth(),
+                    label = { Text("PC 地址（自动发现时免填）") }, modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                 )
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -96,18 +140,33 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Button(onClick = { saveAndPair() }, enabled = code.length == 6) {
+                    Button(onClick = {
+                        prefs.pairingCode = code
+                        prefs.serverFpHex = null
+                        paired = false
+                        status = "配对中…"
+                        ClipPortService.statusText = "配对中…"
+                        requestEssentialPermissions(then = "pair")
+                    }, enabled = code.length == 6) {
                         Text(if (paired) "重新配对" else "配对")
                     }
-                    Button(onClick = { saveAndConnect() }, enabled = host.isNotBlank()) {
+                    Button(onClick = {
+                        prefs.host = host.trim()
+                        prefs.port = port.toIntOrNull() ?: 47190
+                        status = "连接中…"
+                        requestEssentialPermissions(then = null)
+                    }, enabled = host.isNotBlank()) {
                         Text("连接")
                     }
-                    Button(onClick = { autoDiscover() }) {
+                    Button(onClick = {
+                        prefs.host = ""
+                        requestEssentialPermissions(then = "discover")
+                    }) {
                         Text("自动发现")
                     }
                 }
                 Text(
-                    "同一 WiFi 下可点「自动发现」免填 IP（BLE 广播发现）；跨网段时手动填 PC 界面显示的地址。",
+                    "同一 WiFi 下点「自动发现」免填 IP（BLE 广播发现）；跨网段时手动填 PC 主界面显示的本机地址。配对码在 PC 端「开始配对」处生成。",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 HorizontalDivider()
@@ -120,7 +179,7 @@ class MainActivity : ComponentActivity() {
                 OutlinedTextField(
                     value = clearMinutes,
                     onValueChange = { clearMinutes = it.filter { c -> c.isDigit() }.take(3) },
-                    label = { Text("远端剪贴板自动清除（分钟，0=不清除，D-15）") },
+                    label = { Text("远端剪贴板自动清除（分钟，0=不清除）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true,
                 )
                 Button(onClick = {
@@ -129,53 +188,42 @@ class MainActivity : ComponentActivity() {
                 }) { Text("保存清除策略") }
                 HorizontalDivider()
                 Text(
-                    "后台读取: 安装为 LSPosed 模块并在系统框架作用域启用后，重启即可后台读剪贴板（spec D-08）。\n" +
-                        "未 root 设备可授予 READ_LOGS（Shizuku/ADB）作为降级通道。",
+                    "后台读取（PC→手机方向收到内容需读取本机剪贴板）：本应用同时是 LSPosed 模块，" +
+                        "在 LSPosed 管理器中启用并勾选「系统作用域」后重启，即可后台读剪贴板；" +
+                        "未 root 设备可用 ADB/Shizuku 授予 READ_LOGS 走降级通道。",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
         }
     }
 
-    private fun autoDiscover() {
-        // Android 12+ 需要 BLUETOOTH_SCAN；29~30 需要定位权限
-        if (Build.VERSION.SDK_INT >= 31) {
-            scanPerm.launch(Manifest.permission.BLUETOOTH_SCAN)
-        } else {
-            scanPerm.launch(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
-        status = "发现中…"
-        ClipPortService.instance?.requestDiscovery()
-    }
-
-    private val scanPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (!granted) status = "未授予扫描权限，请手动填写 IP"
-    }
-
+    /** 配对：权限落定 → saveAndPair 启动服务并发 PAIR_REQ。 */
     private fun saveAndPair() {
         prefs.host = host.trim()
         prefs.port = port.toIntOrNull() ?: 47190
-        prefs.pairingCode = code
         prefs.serverFpHex = null
         paired = false
         ClipPortService.statusText = "配对中…"
         status = "配对中…"
-        // 重启服务入口（前台 Activity 允许启动 FGS），随后触发配对
-        startForegroundService(Intent(this, ClipPortService::class.java).setAction(ClipPortService.ACTION_START))
+        startServiceSafely()
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             ClipPortService.instance?.requestPair()
         }, 500)
     }
 
-    private fun saveAndConnect() {
-        prefs.host = host.trim()
-        prefs.port = port.toIntOrNull() ?: 47190
-        prefs.clearMs = (clearMinutes.toLongOrNull() ?: 2) * 60000
-        status = "连接中…"
-        ClipPortService.statusText = "连接中…"
-        startForegroundService(Intent(this, ClipPortService::class.java).setAction(ClipPortService.ACTION_START))
+    private fun doAutoDiscover() {
+        status = "发现中…"
+        startServiceSafely()
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            ClipPortService.instance?.requestConnect()
+            ClipPortService.instance?.requestDiscovery()
         }, 500)
+    }
+
+    private fun shortName(permission: String): String = when (permission) {
+        Manifest.permission.BLUETOOTH_CONNECT -> "蓝牙连接"
+        Manifest.permission.BLUETOOTH_SCAN -> "蓝牙扫描"
+        Manifest.permission.POST_NOTIFICATIONS -> "通知"
+        Manifest.permission.ACCESS_FINE_LOCATION -> "定位"
+        else -> permission.substringAfterLast('.')
     }
 }
