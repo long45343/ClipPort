@@ -74,4 +74,7 @@ internal static class Native
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern ushort RegisterClassW(ref WNDCLASS wc);
+
+    public static IntPtr DefWndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
+        => DefWindowProcW(hwnd, msg, wParam, lParam);
 }

@@ -39,9 +39,16 @@ class SyncManager(
     private val seqCounter = java.util.concurrent.atomic.AtomicLong((0 until 0x3FFFFFFF).random().toLong())
     @Volatile var pairingMode = false
 
-    /** 本地剪贴板变化（Service/Watcher 回调，任意线程）。 */
+    @Volatile private var localPending = false
+
+    /** 本地剪贴板变化（Service/Watcher 回调，任意线程）；100ms 防抖合并（spec §1.3）。 */
     fun onLocalClipChanged() {
-        handler.post { handleLocalClip() }
+        if (localPending) return
+        localPending = true
+        handler.postDelayed({
+            localPending = false
+            handleLocalClip()
+        }, ClipConst.DEBOUNCE_MS)
     }
 
     private fun handleLocalClip() {

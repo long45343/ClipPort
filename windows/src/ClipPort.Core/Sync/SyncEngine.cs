@@ -26,6 +26,8 @@ public sealed class SyncEngine : IDisposable
     private DateTime _lastLocalAt = DateTime.MinValue;
     private ClipboardSnapshot? _lastRemote;     // 回声比对窗（1.5s）
     private DateTime _lastRemoteAt = DateTime.MinValue;
+    private readonly ScreenGate _screenGate = new();
+    private ClipboardSnapshot? _lockedPending;  // D-16：锁屏缓存（仅最新一条），解锁补写
 
     public Action<string>? Log { get; set; }
     public Action<string>? StatusChanged { get; set; }
@@ -39,6 +41,16 @@ public sealed class SyncEngine : IDisposable
         _server.OnPairRequest = OnPairRequest;
         _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "clipport-sync" };
         _worker.Start();
+        _screenGate.Unlocked += () => _queue.TryAdd(() =>
+        {
+            if (_lockedPending is { } snap)
+            {
+                _lockedPending = null;
+                WriteRemoteSnap(snap);
+                Log?.Invoke("unlock: 补写锁屏期间收到的剪切板");
+            }
+        });
+        _screenGate.Start();
     }
 
     // ---- 本地剪贴板监听 → 发布（spec §2.1）----
@@ -54,7 +66,7 @@ public sealed class SyncEngine : IDisposable
     private void HandleLocalClip()
     {
         if (!_cfg.SyncEnabled) return;
-        if (ClipboardAccess.IsSelfWrite()) return;          // 防回环第1道：自标记
+        if (_selfWriting || ClipboardAccess.IsSelfWrite()) return;          // 防回环第1道：自标记
         if (ClipboardAccess.IsEmpty()) return;
         var snap = ClipboardAccess.ReadAll();
         if (snap.IsEmpty) return;
@@ -154,6 +166,21 @@ public sealed class SyncEngine : IDisposable
         }
         if (snap.IsEmpty) return;
 
+        // D-16 锁屏门：锁屏缓存最新一条，解锁补写
+        if (ScreenGate.IsLocked())
+        {
+            _lockedPending = snap;
+            Log?.Invoke("screen locked, clip cached");
+            return;
+        }
+        WriteRemoteSnap(snap);
+        _lastRemote = snap;
+        _lastRemoteAt = DateTime.UtcNow;
+        Log?.Invoke($"remote clip applied dev={devId} seq={bc.Seq}");
+    }
+
+    private void WriteRemoteSnap(ClipboardSnapshot snap)
+    {
         _selfWriting = true;
         try
         {
@@ -161,9 +188,6 @@ public sealed class SyncEngine : IDisposable
             ClipboardAccess.Write(snap, _selfSeq);
         }
         finally { _selfWriting = false; }
-        _lastRemote = snap;
-        _lastRemoteAt = DateTime.UtcNow;
-        Log?.Invoke($"remote clip applied dev={devId} seq={bc.Seq}");
     }
 
     // ---- 手机端 REQ_TEXT → 从本地 holder 取内容（spec §2.3 ContentServer）----
