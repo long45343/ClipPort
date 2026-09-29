@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ClipPort</string>
+    <string name="xposed_desc">ClipPort 后台剪贴板读取（hook ClipboardService.isDefaultIme，仅限本应用）</string>
+</resources>
