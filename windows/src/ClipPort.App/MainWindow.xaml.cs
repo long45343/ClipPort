@@ -22,6 +22,8 @@ public sealed partial class MainWindow : Window
 
     public void HideToTray() { _closingToTray = true; AppWindow.Hide(); _closingToTray = false; }
     public void ShowFromTray() { AppWindow.Show(); Activate(); }
+    /// <summary>退出前真正关闭（绕过"关闭=收托盘"拦截）。</summary>
+    public void CloseForExit() { _closingToTray = true; Close(); }
 
     public void SetStatus(string s) => StatusText.Text = s;
 

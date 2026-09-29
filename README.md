@@ -22,10 +22,15 @@ Windows ↔ Android 剪贴板同步软件。基于对小米妙享的逆向分析
 
 ```bash
 # Windows（需 .NET 10 SDK）
+# 模式A 框架依赖（38MB，要求目标机已装 .NET 桌面运行时 10 + Windows App SDK Runtime 1.7）
+cd windows && dotnet publish src/ClipPort.App/ClipPort.App.csproj -c Release -r win-x64 \
+  -p:Platform=x64 -p:SelfContained=false -p:WindowsAppSDKSelfContained=false -o ../dist/windows-fx
+
+# 模式B 自包含（172MB，零依赖，免装运行时）
 cd windows && dotnet publish src/ClipPort.App/ClipPort.App.csproj -c Release -r win-x64 \
   -p:Platform=x64 -p:WindowsAppSDKSelfContained=true -p:SelfContained=true -o ../dist/windows
 
-# Android（需 JDK 17 + Android SDK 35；产物 android/ClipPort-v0.1.0.apk）
+# Android（需 JDK 17 + Android SDK 35；产物 android/ClipPort-v0.1.1.apk）
 export JAVA_HOME=<jdk17> ANDROID_HOME=<sdk>
 cd android && ./gradlew assembleRelease
 # 签名：apksigner sign --ks clipport.keystore --ks-pass pass:clipport2026 ...
