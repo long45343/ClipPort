@@ -73,6 +73,17 @@ class MainActivity : ComponentActivity() {
 
         requestEssentialPermissions(then = null)
         setContent { MaterialTheme { Screen() } }
+        // 服务状态实时回显（服务在后台持续更新 ClipPortService.statusText）
+        val poll = object : Runnable {
+            override fun run() {
+                if (ClipPortService.running && ClipPortService.statusText.isNotBlank()) {
+                    if (status != ClipPortService.statusText && !status.startsWith("配对中") && !status.startsWith("发现中"))
+                        status = ClipPortService.statusText
+                }
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this, 1000)
+            }
+        }
+        android.os.Handler(android.os.Looper.getMainLooper()).post(poll)
     }
 
     /** 申请关键运行时权限；全部已持有时直接执行续作。 */

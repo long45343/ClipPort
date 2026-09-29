@@ -31,18 +31,6 @@ object ClipFilter {
     }
 }
 
-/** 防抖合并（spec §1.3，100ms，对齐小米 CLIP_CHANGE_THRESHOLD）。 */
-class ClipDebouncer : Handler(HandlerThread("clipport-debounce").apply { start() }.looper) {
-    companion object { const val MSG = 1 }
-    init { Thread.currentThread() }
-    fun submit(what: Int = MSG, delayMs: Long = ClipConst.DEBOUNCE_MS, obj: Any? = null) {
-        removeMessages(what)
-        val m = Message.obtain(this, { }) ; m.what = what; m.obj = obj
-        sendMessageDelayed(m, delayMs)
-    }
-    override fun handleMessage(msg: Message) { /* 由持有方覆写回调注入 */ }
-}
-
 /** mime 判定工具。 */
 object MimeUtil {
     fun isHtml(desc: ClipDescription): Boolean = desc.hasMimeType("text/html")

@@ -23,6 +23,8 @@ public sealed class TlsLinkServer : IAsyncDisposable
     public Func<Hello, bool>? OnHello { get; set; }            // 返回是否接受该设备
     public Func<byte[], bool>? OnPairRequest { get; set; }     // 入参 codeHash，返回是否配对成功
     public Action<ClipBroadcast>? OnBroadcast { get; set; }
+    /// <summary>手机间中继开关（多设备同步：A 手机的内容转发给其他已配对链接）。</summary>
+    public bool RelayEnabled { get; set; } = true;
     public Func<TextRequest, TextResponse>? OnTextRequest { get; set; }
     public Action<string>? Log { get; set; }
 
@@ -80,6 +82,15 @@ public sealed class TlsLinkServer : IAsyncDisposable
     }
 
     public uint NextSeq() => Interlocked.Increment(ref _seq);
+
+    public void SendToAllExcept(PhoneLink? except, byte[] frame)
+    {
+        lock (_gate)
+        {
+            foreach (var l in _links.Where(l => l.Alive && l.Paired && l != except).ToList())
+                _ = l.SendAsync(frame);
+        }
+    }
 
     public void SendToAll(byte[] frame)
     {
@@ -180,7 +191,10 @@ public sealed class TlsLinkServer : IAsyncDisposable
                         Pairing.EncodePairOk(ok, _owner._cert != null ? CertManager.Fingerprint(_owner._cert) : Array.Empty<byte>())));
                     break;
                 case FrameCodec.ClipBroadcast:
-                    _owner.OnBroadcast?.Invoke(ClipBroadcast.Decode(payload));
+                    var bc = ClipBroadcast.Decode(payload);
+                    _owner.OnBroadcast?.Invoke(bc);
+                    if (_owner.RelayEnabled)
+                        _owner.SendToAllExcept(this, FrameCodec.Encode(FrameCodec.ClipBroadcast, seq, payload));
                     break;
                 case FrameCodec.RespText:
                 {
