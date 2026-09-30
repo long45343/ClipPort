@@ -20,8 +20,8 @@ public sealed class TlsLinkServer : IAsyncDisposable
     private CancellationTokenSource? _cts;
     private uint _seq;
 
-    public Func<Hello, bool>? OnHello { get; set; }            // 返回是否接受该设备
-    public Func<byte[], bool>? OnPairRequest { get; set; }     // 入参 codeHash，返回是否配对成功
+    public Action<PhoneLink, Hello>? OnHello { get; set; }                 // 链路就绪（用于凭设备ID恢复 Paired 态）
+    public Func<PhoneLink, byte[], bool>? OnPairRequest { get; set; }      // 入参 link+codeHash，返回是否配对成功
     public Action<ClipBroadcast>? OnBroadcast { get; set; }
     /// <summary>手机间中继开关（多设备同步：A 手机的内容转发给其他已配对链接）。</summary>
     public bool RelayEnabled { get; set; } = true;
@@ -57,14 +57,17 @@ public sealed class TlsLinkServer : IAsyncDisposable
     private async Task ServeClient(TcpClient client, CancellationToken ct)
     {
         var link = new PhoneLink(this, client);
+        var remote = (client.Client.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
         try
         {
-            await link.HandshakeAsync(_cert!, ct);
+            Log?.Invoke($"link accepted from {remote}");
+            await link.HandshakeAsync(_cert!, ct).WaitAsync(TimeSpan.FromSeconds(15), ct);
+            Log?.Invoke($"tls done ({link.TlsProtocol}) from {remote}");
             lock (_gate) { _links.RemoveAll(l => !l.Alive); _links.Add(link); }
-            OnHello?.Invoke(link.PeerHello);
+            OnHello?.Invoke(link, link.PeerHello);
             await link.ReadLoop(ct);   // 阻塞直到断开
         }
-        catch (Exception ex) { Log?.Invoke($"link error: {ex.Message}"); }
+        catch (Exception ex) { Log?.Invoke($"link error from {remote}: {ex.Message}"); }
         finally
         {
             lock (_gate) _links.Remove(link);
@@ -127,6 +130,7 @@ public sealed class TlsLinkServer : IAsyncDisposable
         private readonly Dictionary<uint, TaskCompletionSource<TextResponse>> _pending = new();
         public Hello PeerHello { get; private set; } = new();
         public volatile bool Paired;
+        public string TlsProtocol => _ssl?.SslProtocol.ToString() ?? "?";
         public bool Alive => _tcp.Connected && _ssl is { };
 
         public PhoneLink(TlsLinkServer owner, TcpClient tcp) { _owner = owner; _tcp = tcp; }
@@ -186,7 +190,8 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     PeerHello = Hello.Decode(payload);
                     break;
                 case FrameCodec.PairReq:
-                    bool ok = _owner.OnPairRequest?.Invoke(payload) ?? false;
+                    bool ok = _owner.OnPairRequest?.Invoke(this, payload) ?? false;
+                    if (ok) Paired = true;   // ★ 配对成功立即标记，否则 PC 永远不会向该链接推送
                     _ = SendAsync(FrameCodec.Encode(FrameCodec.PairOk, seq,
                         Pairing.EncodePairOk(ok, _owner._cert != null ? CertManager.Fingerprint(_owner._cert) : Array.Empty<byte>())));
                     break;

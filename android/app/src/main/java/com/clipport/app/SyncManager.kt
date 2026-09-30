@@ -236,6 +236,7 @@ class SyncManager(
                     host, prefs.port,
                     pinnedFp = prefs.serverFpHex?.hexToBytes(),
                     self = self, listener = this,
+                    onStep = { step -> status(step) },
                 )
                 link = l
                 l.connect(trustAny = !pinned)

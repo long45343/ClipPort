@@ -39,6 +39,7 @@ public sealed class SyncEngine : IDisposable
         _server.OnBroadcast = OnBroadcastFrame;
         _server.OnTextRequest = OnTextRequest;
         _server.OnPairRequest = OnPairRequest;
+        _server.OnHello = OnPhoneHello;
         _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "clipport-sync" };
         _worker.Start();
         _screenGate.Unlocked += () => _queue.TryAdd(() =>
@@ -219,14 +220,27 @@ public sealed class SyncEngine : IDisposable
         };
     }
 
-    private bool OnPairRequest(byte[] codeHash)
+    private bool OnPairRequest(Net.TlsLinkServer.PhoneLink link, byte[] codeHash)
     {
         if (!_cfg.PairingOpen || _cfg.PairingCodeHash is null) return false;
         if (!codeHash.AsSpan().SequenceEqual(_cfg.PairingCodeHash)) return false;
         _cfg.PairingOpen = false;
+        _cfg.PairedPhoneId = Convert.ToHexString(link.PeerHello.DeviceId);
         _cfg.Save();
         StatusChanged?.Invoke("paired");
         return true;
+    }
+
+    /// <summary>已配对手机重连：凭 HELLO 中的设备ID恢复链接的 Paired 态（否则 PC 永远不向它推送）。</summary>
+    private void OnPhoneHello(Net.TlsLinkServer.PhoneLink link, Hello hello)
+    {
+        var id = Convert.ToHexString(hello.DeviceId);
+        if (!string.IsNullOrEmpty(_cfg.PairedPhoneId) &&
+            string.Equals(_cfg.PairedPhoneId, id, StringComparison.OrdinalIgnoreCase))
+        {
+            link.Paired = true;
+            Log?.Invoke($"paired phone reconnected: {hello.Name}");
+        }
     }
 
     private void WorkerLoop()

@@ -28,6 +28,7 @@ class PcLink(
     private val pinnedFp: ByteArray?,
     private val self: Hello,
     private val listener: Listener,
+    private val onStep: (String) -> Unit = {},
 ) {
     interface Listener {
         fun onBroadcast(bc: ClipBroadcast)
@@ -53,11 +54,16 @@ class PcLink(
         val plain = Socket()
         plain.tcpNoDelay = true
         plain.connect(InetSocketAddress(host, port), 5000)
+        onStep("TCP 已连 $host:$port")
         val ctx = SSLContext.getInstance("TLS")
         ctx.init(null, arrayOf(trustManager(trustAny)), SecureRandom())
         val s = ctx.socketFactory.createSocket(plain, host, port, true) as SSLSocket
+        s.soTimeout = 10_000   // 握手期 10s 超时，杜绝"永久挂起无反应"
+        onStep("TLS 握手中…")
         s.startHandshake()
+        s.soTimeout = 0        // 握手完成后恢复无超时（读循环靠心跳判活）
         serverFp = MessageDigest.getInstance("SHA-256").digest(s.session.peerCertificates[0].encoded)
+        onStep("TLS 完成 (${s.session.protocol})")
         socket = plain
         ssl = s
         input = s.inputStream
