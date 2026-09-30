@@ -176,3 +176,15 @@
 
 ## 一致性检查
 - 状态：⬜ 未执行（全部决策完成后填写，结果输出至 SPEC/04-consistency-check.md）
+
+---
+
+## 二期工程：对等模式（2026-09-30 启动）
+
+地基（v0.1.9/v0.2.0 真机验证）基本通过后，按此前讨论的路线二推进。里程碑：
+
+- **M6 PC 客户端角色**：PC↔PC 互相同步；PhoneLink 支持双模式握手；PAIR_REQ 扩展携带加入方指纹；PAIR_OK 扩展携带名称；PeerStore 对端库持久化；两侧 HELLO 对称发送
+- **M7 Android 服务端角色**：BouncyCastle 自签证书 + SSLServerSocket(47191)；PcLink 双模式；对称配对（手机也可当被连方/配对窗口方）
+- **M8 发现升级**：UDP 广播发现（全设备通用，无蓝牙依赖——解决 RadioNotAvailable 场景）为主，BLE 保留；对端端点自动刷新与自动重连组网；Android 对端列表 UI
+- 拓扑：全逻辑网状（每台设备 = 服务端+客户端+发布者+订阅者+内容源），成对配对互信（KDE Connect 模式），广播直发、懒取直连源设备
+- 注：D-02 的"BLE 为主"在二期演进为"UDP 发现为主干 + BLE 保留"——RadioNotAvailable 实测证明 BLE 不能作为 PC 侧唯一发现手段
