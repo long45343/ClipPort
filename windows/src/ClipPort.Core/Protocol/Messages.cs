@@ -26,7 +26,7 @@ public sealed class ClipBroadcast
         Proto.WriteBytes(o, 1, DeviceId);
         Proto.WriteUint(o, 2, Seq);
         Proto.WriteBool(o, 3, NeedChannel);
-        foreach (var m in MimeCodes) Proto.WriteUint(o, 4, m);
+        foreach (var m in MimeCodes) Proto.WriteUint(o, 4, m, omitZero: false);
         if (Inline != null) Proto.WriteMessage(o, 5, Inline.Encode());
         return o.ToArray();
     }

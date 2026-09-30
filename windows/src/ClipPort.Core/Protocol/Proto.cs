@@ -11,9 +11,9 @@ public static class Proto
 
     public static void WriteTag(List<byte> o, int field, int wireType) => WriteVarint(o, (uint)((field << 3) | wireType));
 
-    public static void WriteUint(List<byte> o, int field, uint v)
+    public static void WriteUint(List<byte> o, int field, uint v, bool omitZero = true)
     {
-        if (v == 0) return;
+        if (omitZero && v == 0) return;
         WriteTag(o, field, 0); WriteVarint(o, v);
     }
 

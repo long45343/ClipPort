@@ -67,7 +67,9 @@ object Proto {
 
     private fun tag(o: ArrayList<Byte>, field: Int, wireType: Int) = writeVarint(o, ((field shl 3) or wireType).toLong())
 
-    fun uint(o: ArrayList<Byte>, field: Int, v: Long) { if (v != 0L) { tag(o, field, 0); writeVarint(o, v) } }
+    fun uint(o: ArrayList<Byte>, field: Int, v: Long, omitZero: Boolean = true) {
+        if (!omitZero || v != 0L) { tag(o, field, 0); writeVarint(o, v) }
+    }
     fun bool(o: ArrayList<Byte>, field: Int, v: Boolean) { if (v) { tag(o, field, 0); writeVarint(o, 1) } }
     fun bytes(o: ArrayList<Byte>, field: Int, b: ByteArray) {
         if (b.isEmpty()) return
@@ -138,7 +140,7 @@ class ClipBroadcast {
         Proto.bytes(o, 1, deviceId)
         Proto.uint(o, 2, seq)
         Proto.bool(o, 3, needChannel)
-        for (m in mimeCodes) Proto.uint(o, 4, m)
+        for (m in mimeCodes) Proto.uint(o, 4, m, omitZero = false)
         inline?.let { Proto.message(o, 5, it.encode()) }
         return o.toByteArray()
     }
