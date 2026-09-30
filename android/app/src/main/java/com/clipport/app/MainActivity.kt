@@ -141,11 +141,11 @@ class MainActivity : ComponentActivity() {
                 )
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(
-                        value = port, onValueChange = { port = it.filter { c -> c.isDigit() } },
+                        value = port, onValueChange = { port = normalizeDigits(it).take(5) },
                         label = { Text("端口") }, modifier = Modifier.weight(1f), singleLine = true,
                     )
                     OutlinedTextField(
-                        value = code, onValueChange = { code = it.filter { c -> c.isDigit() }.take(6) },
+                        value = code, onValueChange = { code = normalizeDigits(it).take(6) },
                         label = { Text("配对码") }, modifier = Modifier.weight(1f), singleLine = true,
                     )
                 }
@@ -188,7 +188,7 @@ class MainActivity : ComponentActivity() {
                 }
                 OutlinedTextField(
                     value = clearMinutes,
-                    onValueChange = { clearMinutes = it.filter { c -> c.isDigit() }.take(3) },
+                    onValueChange = { clearMinutes = normalizeDigits(it).take(3) },
                     label = { Text("远端剪贴板自动清除（分钟，0=不清除）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true,
                 )
@@ -229,6 +229,13 @@ class MainActivity : ComponentActivity() {
             ClipPortService.instance?.requestDiscovery()
         }, 500)
     }
+
+    /** 数字输入规范化：中文输入法的全角数字(１２３)显示与半角无法分辨但字节不同，
+     *  直接进入哈希会导致配对码"看着对却哈希不匹配"。统一转为 ASCII 半角。 */
+    private fun normalizeDigits(s: String): String =
+        s.filter { it.isDigit() }
+            .map { Character.getNumericValue(it).toString() }
+            .joinToString("")
 
     private fun shortName(permission: String): String = when (permission) {
         Manifest.permission.BLUETOOTH_CONNECT -> "蓝牙连接"
