@@ -21,7 +21,7 @@ object PcDiscovery {
 
     private fun parse(bytes: ByteArray): Pair<String, Int>? {
         if (bytes.size < 12 || bytes[0] != 'C'.code.toByte() || bytes[1] != 'P'.code.toByte()) return null
-        val ip = "\${bytes[2].toInt() and 0xFF}.\${bytes[3].toInt() and 0xFF}.\${bytes[4].toInt() and 0xFF}.\${bytes[5].toInt() and 0xFF}"
+        val ip = "${bytes[2].toInt() and 0xFF}.${bytes[3].toInt() and 0xFF}.${bytes[4].toInt() and 0xFF}.${bytes[5].toInt() and 0xFF}"
         val port = ((bytes[7].toInt() and 0xFF) shl 8) or (bytes[6].toInt() and 0xFF)
         return ip to port
     }
@@ -32,7 +32,7 @@ object PcDiscovery {
             val bytes = result.scanRecord?.getManufacturerSpecificData(COMPANY_ID) ?: return
             val hit = parse(bytes) ?: return
             stop()
-            Log.i("PcDiscovery", "found PC at \$hit.first:\$hit.second")
+            Log.i("PcDiscovery", "found PC at ${'$'}{hit.first}:${'$'}{hit.second}")
             onFound?.invoke(hit.first, hit.second)
         }
 

@@ -219,7 +219,15 @@ class SyncManager(
                 connect(pinned = prefs.serverFpHex != null)
             }
         }
-        val ok = PcDiscovery.start(prefs.serverFpHex)
+        val ok = PcDiscovery.start(prefs.serverFpHex) { count ->
+            status(
+                when {
+                    count < 0 -> "扫描失败（错误码 ${-count}）——检查蓝牙/定位权限"
+                    count == 0 -> "30 秒未收到任何 BLE 广播——确认两端蓝牙已开启、PC 应用正在运行"
+                    else -> "扫到 $count 条广播但无 ClipPort 匹配——查看 PC 日志「BLE 广播状态」"
+                }
+            )
+        }
         if (!ok) status("BLE 不可用（权限/硬件），请手动填写 IP")
         return ok
     }
