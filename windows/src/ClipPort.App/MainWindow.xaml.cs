@@ -36,6 +36,15 @@ public sealed partial class MainWindow : Window
         LogList.ScrollIntoView(LogList.Items[^1]);
     }
 
+    private void ConnectPeer_Click(object sender, RoutedEventArgs e)
+    {
+        var host = PeerHostBox.Text.Trim();
+        var port = int.TryParse(PeerPortBox.Text, out var p) ? p : 47190;
+        var code = PeerCodeBox.Text.Trim();
+        if (host.Length == 0) { AppendLog("请填写对端 IP"); return; }
+        App.Instance!.ConnectToPeer(host, port, code.Length == 6 ? code : null);
+    }
+
     private void PairBtn_Click(object sender, RoutedEventArgs e)
     {
         App.Instance!.OpenPairing(out var code);

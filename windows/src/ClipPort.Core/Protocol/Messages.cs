@@ -163,41 +163,45 @@ public sealed class Hello
 /// <summary>PAIR_REQ{sha256(code)=1} / PAIR_OK{ok=1, cert_fp=2}。</summary>
 public static class Pairing
 {
-    public static byte[] EncodePairReq(byte[] codeHash)
+    /// <summary>PAIR_REQ{codeHash=1, joinerFp=2(二期: 加入方证书指纹, 可空)}。</summary>
+    public static byte[] EncodePairReq(byte[] codeHash, byte[]? joinerFp = null)
     {
         var o = new List<byte>();
         Proto.WriteBytes(o, 1, codeHash);
+        Proto.WriteBytes(o, 2, joinerFp);
         return o.ToArray();
     }
 
-    public static byte[] DecodePairReq(byte[] payload)
+    public static (byte[] CodeHash, byte[]? JoinerFp) DecodePairReq(byte[] payload)
     {
+        byte[] hash = Array.Empty<byte>(); byte[]? jfp = null;
         var r = new Proto.Reader(payload);
         while (r.ReadTag(out var f, out var wt))
         {
-            if (f == 1) return r.ReadBytes();
-            r.Skip(wt);
+            switch (f) { case 1: hash = r.ReadBytes(); break; case 2: jfp = r.ReadBytes(); break; default: r.Skip(wt); break; }
         }
-        return Array.Empty<byte>();
+        return (hash, jfp);
     }
 
-    public static byte[] EncodePairOk(bool ok, byte[] certFp)
+    /// <summary>PAIR_OK{ok=1, certFp=2, name=3(二期)}。</summary>
+    public static byte[] EncodePairOk(bool ok, byte[] certFp, string? name = null)
     {
         var o = new List<byte>();
         Proto.WriteBool(o, 1, ok);
         Proto.WriteBytes(o, 2, certFp);
+        Proto.WriteString(o, 3, name);
         return o.ToArray();
     }
 
-    public static (bool Ok, byte[] Fp) DecodePairOk(byte[] payload)
+    public static (bool Ok, byte[] Fp, string Name) DecodePairOk(byte[] payload)
     {
-        bool ok = false; byte[] fp = Array.Empty<byte>();
+        bool ok = false; byte[] fp = Array.Empty<byte>(); string name = "";
         var r = new Proto.Reader(payload);
         while (r.ReadTag(out var f, out var wt))
         {
-            switch (f) { case 1: ok = r.ReadBool(); break; case 2: fp = r.ReadBytes(); break; default: r.Skip(wt); break; }
+            switch (f) { case 1: ok = r.ReadBool(); break; case 2: fp = r.ReadBytes(); break; case 3: name = r.ReadString(); break; default: r.Skip(wt); break; }
         }
-        return (ok, fp);
+        return (ok, fp, name);
     }
 }
 

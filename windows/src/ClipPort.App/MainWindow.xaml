@@ -25,7 +25,16 @@
             <Button x:Name="PairBtn" Content="开始配对" Click="PairBtn_Click"/>
             <TextBlock x:Name="PairCodeText" Text="" FontSize="20" FontWeight="Bold" VerticalAlignment="Center"/>
         </StackPanel>
-        <TextBlock Grid.Row="3" Text="日志"/>
-        <ListView x:Name="LogList" Grid.Row="4" SelectionMode="None"/>
+        <StackPanel Grid.Row="3" Spacing="8">
+            <TextBlock Text="连接其他设备（对端需先点「开始配对」获得配对码）"/>
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBox x:Name="PeerHostBox" PlaceholderText="对端 IP" Width="160"/>
+                <TextBox x:Name="PeerPortBox" PlaceholderText="端口" Text="47190" Width="80"/>
+                <TextBox x:Name="PeerCodeBox" PlaceholderText="配对码(可选)" Width="110"/>
+                <Button Content="连接" Click="ConnectPeer_Click"/>
+            </StackPanel>
+        </StackPanel>
+        <TextBlock Grid.Row="4" Text="日志"/>
+        <ListView x:Name="LogList" Grid.Row="5" SelectionMode="None"/>
     </Grid>
 </Window>

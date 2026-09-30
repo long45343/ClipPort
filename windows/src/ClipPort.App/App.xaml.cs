@@ -1,4 +1,5 @@
 using Microsoft.UI.Dispatching;
+using System.Security.Cryptography.X509Certificates;
 using Microsoft.UI.Xaml;
 using ClipPort.Core.Net;
 using System.Net;
@@ -57,6 +58,13 @@ public partial class App : Application
         Server = new TlsLinkServer();
         Engine = new SyncEngine(Config, Server) { Log = OnEngineLog, StatusChanged = OnStatus };
         Server.Log = OnEngineLog;
+        Server.OwnHelloProvider = () => new Core.Protocol.Hello
+        {
+            Name = Config.DeviceName,
+            DeviceType = 0,
+            ProtoVer = 1,
+            DeviceId = Convert.FromHexString(Config.DeviceId),
+        };
         _listener = new ClipboardListener();
         _listener.ClipChanged += () => Engine.OnLocalClipChanged();
         _listener.Start();
@@ -73,6 +81,8 @@ public partial class App : Application
 
         // 若被配对设备拉起（BLE 广播发现入口），v1 常开监听
         StartServer();
+
+        ReconnectKnownPeers();
 
         _main = new MainWindow();
         _main.Activate();
@@ -92,11 +102,14 @@ public partial class App : Application
         Exit();
     }
 
+    private X509Certificate2? _ownCert;
+
     private void StartServer()
     {
         try
         {
             var cert = CertManager.GetOrCreate();
+            _ownCert = cert;
             Server!.Start(Config.TcpPort, cert);
             // 注意：不再清除 PairingCodeHash/PairingOpen——配对窗口跨重启有效，
             // 否则每次更新重启后手机用界面上的码配对会永远失败
@@ -115,6 +128,16 @@ public partial class App : Application
         }
         catch (Exception ex) { OnEngineLog("server start failed: " + ex.Message); }
     }
+
+    public void ConnectToPeer(string host, int port, string? code)
+    {
+        Engine!.OwnFpProvider ??= () => _ownCert is null ? null : System.Security.Cryptography.SHA256.HashData(_ownCert.RawData);
+        Engine.ConnectPeer(host, port, code);
+        OnEngineLog($"正在连接对端 {host}:{port}…");
+    }
+
+    /// <summary>启动后自动重连已知对端（二期自动组网）。</summary>
+    public void ReconnectKnownPeers() => Engine?.ReconnectKnownPeers();
 
     public void OpenPairing(out string code)
     {

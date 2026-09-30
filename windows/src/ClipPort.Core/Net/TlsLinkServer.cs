@@ -20,8 +20,12 @@ public sealed class TlsLinkServer : IAsyncDisposable
     private CancellationTokenSource? _cts;
     private uint _seq;
 
-    public Action<PhoneLink, Hello>? OnHello { get; set; }                 // 链路就绪（用于凭设备ID恢复 Paired 态）
-    public Func<PhoneLink, byte[], bool>? OnPairRequest { get; set; }      // 入参 link+codeHash，返回是否配对成功
+    public Action<PhoneLink, Hello>? OnHello { get; set; }                 // 设备ID就绪（恢复 Paired 态/登记对端）
+    /// <summary>本端 HELLO 提供者（接受与连出链路都要互发 HELLO 完成对称识别）。</summary>
+    public Func<Hello>? OwnHelloProvider { get; set; }
+    /// <summary>本端作为加入方时收到 PAIR_OK（对端=acceptor）。</summary>
+    public Action<PhoneLink, bool, byte[], string>? OnPairOk { get; set; }
+    public Func<PhoneLink, byte[], byte[]?, bool>? OnPairRequest { get; set; }      // 入参 link+codeHash，返回是否配对成功
     public Action<ClipBroadcast>? OnBroadcast { get; set; }
     /// <summary>手机间中继开关（多设备同步：A 手机的内容转发给其他已配对链接）。</summary>
     public bool RelayEnabled { get; set; } = true;
@@ -61,7 +65,10 @@ public sealed class TlsLinkServer : IAsyncDisposable
         try
         {
             Log?.Invoke($"link accepted from {remote}");
-            await link.HandshakeAsync(_cert!, ct).WaitAsync(TimeSpan.FromSeconds(15), ct);
+            await link.HandshakeAsync(_cert!, null, trustAny: true, remote?.ToString() ?? "", ct)
+                .WaitAsync(TimeSpan.FromSeconds(15), ct);
+            if (OwnHelloProvider != null)
+                _ = link.SendAsync(FrameCodec.Encode(FrameCodec.Hello, NextSeq(), OwnHelloProvider().Encode()));
             Log?.Invoke($"tls done ({link.TlsProtocol}) from {remote}");
             lock (_gate) { _links.RemoveAll(l => !l.Alive); _links.Add(link); }
             await link.ReadLoop(ct);   // 阻塞直到断开
@@ -72,6 +79,34 @@ public sealed class TlsLinkServer : IAsyncDisposable
             lock (_gate) _links.Remove(link);
             link.Dispose();
         }
+    }
+
+    /// <summary>主动连出到对端设备（二期对等模式：PC 也可作为客户端）。</summary>
+    public async Task<PhoneLink> ConnectOutAsync(string host, int port, byte[]? pinnedFp, bool trustAny, CancellationToken ct)
+    {
+        if (_cert is null) throw new InvalidOperationException("server not started (no cert)");
+        var client = new TcpClient();
+        client.NoDelay = true;
+        await client.ConnectAsync(host, port, ct);
+        var link = new PhoneLink(this, client);
+        var remote = (client.Client.RemoteEndPoint as IPEndPoint)?.Address;
+        try
+        {
+            Log?.Invoke($"connect-out to {host}:{port}");
+            await link.HandshakeAsync(null, pinnedFp, trustAny, host, ct).WaitAsync(TimeSpan.FromSeconds(15), ct);
+            Log?.Invoke($"tls done ({link.TlsProtocol}) to {host}:{port}");
+            lock (_gate) { _links.RemoveAll(l => !l.Alive); _links.Add(link); }
+            if (OwnHelloProvider != null)
+                _ = link.SendAsync(FrameCodec.Encode(FrameCodec.Hello, NextSeq(), OwnHelloProvider().Encode()));
+            _ = Task.Run(() => link.ReadLoopCompat(ct), ct);
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"connect-out failed to {host}:{port}: {ex.Message}");
+            link.Dispose();
+            throw;
+        }
+        return link;
     }
 
     private async Task PingLoop(CancellationToken ct)
@@ -132,19 +167,53 @@ public sealed class TlsLinkServer : IAsyncDisposable
         public Hello PeerHello { get; private set; } = new();
         public volatile bool Paired;
         public string TlsProtocol => _ssl?.SslProtocol.ToString() ?? "?";
+        public string RemoteEndpointText => (_tcp.Client.RemoteEndPoint as IPEndPoint)?.ToString() ?? "";
         public bool Alive => _tcp.Connected && _ssl is { };
 
         public PhoneLink(TlsLinkServer owner, TcpClient tcp) { _owner = owner; _tcp = tcp; }
 
-        public async Task HandshakeAsync(X509Certificate2 cert, CancellationToken ct)
+        private string _host = "";
+        private byte[]? _expectedFp;
+        private bool _trustAny;
+
+        /// <summary>server 模式：出本端证书；client 模式：按 pinnedFp 校验对端（trustAny 用于配对）。</summary>
+        public async Task HandshakeAsync(X509Certificate2? cert, byte[]? pinnedFp, bool trustAny, string host, CancellationToken ct)
         {
+            _host = host;
+            _expectedFp = pinnedFp;
+            _trustAny = trustAny;
             var raw = _tcp.GetStream();
             _ssl = new SslStream(raw, false);
-            await _ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+            if (cert != null)
             {
-                ServerCertificate = cert,
-                EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls13 | System.Security.Authentication.SslProtocols.Tls12,
-            }, ct);
+                await _ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = cert,
+                    EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls13 | System.Security.Authentication.SslProtocols.Tls12,
+                }, ct);
+            }
+            else
+            {
+                await _ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                {
+                    TargetHost = host,
+                    EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls13 | System.Security.Authentication.SslProtocols.Tls12,
+                    RemoteCertificateValidationCallback = ValidateRemoteCert,
+                }, ct);
+            }
+        }
+
+        private bool ValidateRemoteCert(object sender, X509Certificate? cert, X509Chain? chain, System.Net.Security.SslPolicyErrors errors)
+        {
+            if (_trustAny) return true;
+            if (cert is null || _expectedFp is null) return false;
+            var fp = System.Security.Cryptography.SHA256.HashData(cert.GetRawCertData());
+            return fp.AsSpan().SequenceEqual(_expectedFp);
+        }
+
+        public async Task ReadLoopCompat(CancellationToken ct)
+        {
+            await ReadLoop(ct);
         }
 
         public async Task ReadLoop(CancellationToken ct)
@@ -192,8 +261,8 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     _owner.OnHello?.Invoke(this, PeerHello);   // ★ 设备ID就绪后才触发, 重连方能恢复 Paired 态
                     break;
                 case FrameCodec.PairReq:
-                    var codeHash = Pairing.DecodePairReq(payload);   // ★ 此前漏了解码, 整条 protobuf 消息被当成哈希比对
-                    bool ok = _owner.OnPairRequest?.Invoke(this, codeHash) ?? false;
+                    var (pairHash, joinerFp) = Pairing.DecodePairReq(payload);   // ★ 此前漏了解码, 整条 protobuf 消息被当成哈希比对
+                    bool ok = _owner.OnPairRequest?.Invoke(this, pairHash, joinerFp) ?? false;
                     if (ok) Paired = true;   // ★ 配对成功立即标记，否则 PC 永远不会向该链接推送
                     _ = SendAsync(FrameCodec.Encode(FrameCodec.PairOk, seq,
                         Pairing.EncodePairOk(ok, _owner._cert != null ? CertManager.Fingerprint(_owner._cert) : Array.Empty<byte>())));
@@ -204,6 +273,12 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     if (_owner.RelayEnabled)
                         _owner.SendToAllExcept(this, FrameCodec.Encode(FrameCodec.ClipBroadcast, seq, payload));
                     break;
+                case FrameCodec.PairOk:
+                {
+                    var (pOk, pFp, pName) = Pairing.DecodePairOk(payload);
+                    _owner.OnPairOk?.Invoke(this, pOk, pFp, pName);
+                    break;
+                }
                 case FrameCodec.RespText:
                 {
                     var resp = TextResponse.Decode(payload);

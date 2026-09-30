@@ -27,6 +27,9 @@ public sealed class SyncEngine : IDisposable
     private ClipboardSnapshot? _lastRemote;     // 回声比对窗（1.5s）
     private DateTime _lastRemoteAt = DateTime.MinValue;
     private readonly ScreenGate _screenGate = new();
+    public Net.PeerStore Peers { get; } = Net.PeerStore.Load();
+    /// <summary>本端证书指纹提供者（SHA256(DER)，App 注入）。</summary>
+    public Func<byte[]?>? OwnFpProvider { get; set; }
     private ClipboardSnapshot? _lockedPending;  // D-16：锁屏缓存（仅最新一条），解锁补写
 
     public Action<string>? Log { get; set; }
@@ -40,6 +43,8 @@ public sealed class SyncEngine : IDisposable
         _server.OnTextRequest = OnTextRequest;
         _server.OnPairRequest = OnPairRequest;
         _server.OnHello = OnPhoneHello;
+        _server.OnPairOk = OnPairOkResult;
+        _server.OwnHelloProvider = OwnHello;
         _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "clipport-sync" };
         _worker.Start();
         _screenGate.Unlocked += () => _queue.TryAdd(() =>
@@ -193,6 +198,48 @@ public sealed class SyncEngine : IDisposable
         finally { _selfWriting = false; }
     }
 
+    // ---- 二期对等模式：连出对端（配对加入或已知对端重连）----
+    public void ConnectPeer(string host, int port, string? code)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                byte[]? pinned = null;
+                var trustAny = true;
+                if (string.IsNullOrEmpty(code))
+                {
+                    // 已知对端重连：端点匹配库中条目 → 用其证书指纹固定校验
+                    var known = Peers.Peers.FirstOrDefault(p =>
+                        string.Equals(p.LastEndpoint, $"{host}:{port}", StringComparison.OrdinalIgnoreCase));
+                    pinned = known?.CertFpHex is { Length: 64 } hex ? Convert.FromHexString(hex) : null;
+                    trustAny = pinned is null;
+                }
+                var link = await _server.ConnectOutAsync(host, port, pinned, trustAny, _cts.Token);
+                Peers.Upsert("", "", null, $"{host}:{port}");  // 仅刷新端点占位；正式登记在 HELLO/PAIR 后
+                if (!string.IsNullOrEmpty(code))
+                {
+                    var hash = AppConfig.CodeHash(code);
+                    var req = Pairing.EncodePairReq(hash, OwnFpProvider?.Invoke());
+                    await link.SendAsync(FrameCodec.Encode(FrameCodec.PairReq, _server.NextSeq(), req));
+                    Log?.Invoke($"已发送配对请求至 {host}:{port}");
+                }
+            }
+            catch (Exception ex) { Log?.Invoke($"connect peer {host}:{port} failed: {ex.Message}"); }
+        });
+    }
+
+    /// <summary>启动时对已知端点的对端发起重连（二期自动组网的第一步）。</summary>
+    public void ReconnectKnownPeers()
+    {
+        foreach (var p in Peers.Peers.Where(p => !string.IsNullOrEmpty(p.LastEndpoint)).ToList())
+        {
+            var ep = p.LastEndpoint!.Split(':');
+            if (ep.Length == 2 && int.TryParse(ep[1], out var port))
+                ConnectPeer(ep[0], port, null);
+        }
+    }
+
     // ---- 手机端 REQ_TEXT → 从本地 holder 取内容（spec §2.3 ContentServer）----
     private TextResponse OnTextRequest(TextRequest req)
     {
@@ -222,7 +269,7 @@ public sealed class SyncEngine : IDisposable
         };
     }
 
-    private bool OnPairRequest(Net.TlsLinkServer.PhoneLink link, byte[] codeHash)
+    private bool OnPairRequest(Net.TlsLinkServer.PhoneLink link, byte[] codeHash, byte[]? joinerFp)
     {
         // 幂等：已配对设备再次发起配对（重装/换码后重试）直接放行
         var helloId = Convert.ToHexString(link.PeerHello.DeviceId);
@@ -244,12 +291,15 @@ public sealed class SyncEngine : IDisposable
         }
         _cfg.PairingOpen = false;
         _cfg.PairedPhoneId = Convert.ToHexString(link.PeerHello.DeviceId);
-        _cfg.Save();
+        // 二期: 登记对端（含加入方证书指纹，用于本端连出时校验）
+        var jfp = joinerFp is { Length: > 0 } ? Convert.ToHexString(joinerFp) : null;
+        Peers.Upsert(Convert.ToHexString(link.PeerHello.DeviceId), link.PeerHello.Name, jfp, null);
+        Peers.Save();
         StatusChanged?.Invoke("paired");
         return true;
     }
 
-    /// <summary>已配对手机重连：凭 HELLO 中的设备ID恢复链接的 Paired 态（否则 PC 永远不向它推送）。</summary>
+    /// <summary>对端 HELLO：恢复 Paired 态 + 对端库登记（二期对等模式）。</summary>
     private void OnPhoneHello(Net.TlsLinkServer.PhoneLink link, Hello hello)
     {
         var id = Convert.ToHexString(hello.DeviceId);
@@ -257,8 +307,33 @@ public sealed class SyncEngine : IDisposable
             string.Equals(_cfg.PairedPhoneId, id, StringComparison.OrdinalIgnoreCase))
         {
             link.Paired = true;
-            Log?.Invoke($"paired phone reconnected: {hello.Name}");
+            Log?.Invoke($"paired peer reconnected: {hello.Name}");
         }
+        var endpoint = link.RemoteEndpointText;
+        Peers.Upsert(id, hello.Name, null, endpoint);
+    }
+
+    private Hello OwnHello() => new Hello
+    {
+        Name = _cfg.DeviceName,
+        DeviceType = 0,
+        ProtoVer = 1,
+        DeviceId = Convert.FromHexString(_cfg.DeviceId),
+    };
+
+    /// <summary>本端作为加入方：PAIR_OK 结果处理（登记对端 + 指纹固定 + 标记链接）。</summary>
+    private void OnPairOkResult(Net.TlsLinkServer.PhoneLink link, bool ok, byte[] peerFp, string peerName)
+    {
+        if (!ok) { Log?.Invoke("加入方配对被拒绝（配对码不匹配/窗口未开）"); StatusChanged?.Invoke("pair-rejected"); return; }
+        link.Paired = true;
+        var id = Convert.ToHexString(link.PeerHello.DeviceId);
+        Peers.Upsert(id,
+            string.IsNullOrEmpty(peerName) ? link.PeerHello.Name : peerName,
+            peerFp is { Length: > 0 } ? Convert.ToHexString(peerFp) : null,
+            link.RemoteEndpointText);
+        Peers.Save();
+        Log?.Invoke($"已加入对端: {peerName} ({id[..12]}…)");
+        StatusChanged?.Invoke("paired");
     }
 
     private void WorkerLoop()
