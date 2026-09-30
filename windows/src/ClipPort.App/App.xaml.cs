@@ -102,7 +102,12 @@ public partial class App : Application
             // 否则每次更新重启后手机用界面上的码配对会永远失败
             var fp = CertManager.Fingerprint(cert);
             // BLE 常驻广播（D-02）：手机扫描后自动回填 IP 连入，无需手动输入
-            try { BlePublisher.Start(Config.TcpPort, fp); } catch (Exception ex) { OnEngineLog("ble 广播不可用: " + ex.Message); }
+            try
+            {
+                BlePublisher.StatusLog = OnEngineLog;
+                BlePublisher.Start(Config.TcpPort, fp);
+            }
+            catch (Exception ex) { OnEngineLog("ble 广播不可用: " + ex.Message); }
             var ips = BlePublisher.AllLanIpv4().Select(a => a.ToString()).ToList();
             var addrText = string.Join("  ", ips.Select(ip => $"{ip}:{Config.TcpPort}"));
             OnEngineLog($"本机地址: {addrText}（手机自动发现中，也可手动填写）");

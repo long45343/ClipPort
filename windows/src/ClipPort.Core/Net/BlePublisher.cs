@@ -14,12 +14,13 @@ namespace ClipPort.Core.Net;
 public static class BlePublisher
 {
     private static BluetoothLEAdvertisementPublisher? _publisher;
+    public static Action<string>? StatusLog;
 
     public static void Start(ushort port, byte[] certFingerprint)
     {
         Stop();
-        var ip = FirstLanIpv4();
-        if (ip is null) return;
+        var ip = PreferredLanIpv4();
+        if (ip is null) { StatusLog?.Invoke("BLE 广播跳过: 未找到局域网 IPv4"); return; }
         var payload = BuildPayload(ip, port, certFingerprint);
         var writer = new DataWriter();
         writer.WriteBytes(payload);
@@ -29,8 +30,12 @@ public static class BlePublisher
             CompanyId = 0xFFFF,
             Data = writer.DetachBuffer(),
         });
+        publisher.StatusChanged += (p, args) =>
+            StatusLog?.Invoke($"BLE 广播状态: {args.Status}" +
+                (args.Error == Windows.Devices.Bluetooth.BluetoothError.Success ? "" : $" 错误={args.Error}"));
         publisher.Start();
         _publisher = publisher;
+        StatusLog?.Invoke($"BLE 广播请求已发出: {ip}:{port} fp={Convert.ToHexString(certFingerprint[..4])} payload={Convert.ToHexString(payload.ToArray())}");
     }
 
     public static void Stop()
@@ -38,6 +43,12 @@ public static class BlePublisher
         try { _publisher?.Stop(); } catch { }
         _publisher = null;
     }
+
+    /// <summary>优先 192.168.*（真实网段），规避 Clash TUN/WSL/vEthernet 等虚拟适配器地址。</summary>
+    public static IPAddress? PreferredLanIpv4() =>
+        AllLanIpv4().OrderByDescending(a => a.ToString().StartsWith("192.168."))
+            .ThenByDescending(a => a.ToString().StartsWith("10."))
+            .FirstOrDefault();
 
     public static byte[] BuildPayload(IPAddress ip, ushort port, byte[] fp)
     {

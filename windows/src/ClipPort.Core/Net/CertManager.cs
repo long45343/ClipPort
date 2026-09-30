@@ -31,7 +31,9 @@ public static class CertManager
         return cert;
     }
 
-    public static byte[] Fingerprint(X509Certificate2 cert) => cert.GetCertHash();
+    /// <summary>证书指纹 = SHA-256( DER )。注意 GetCertHash() 返回的是原始 DER 而非哈希,
+    /// 此前两端定义不一致(手机按 SHA256(der) 比对)导致指纹固定永远失败。</summary>
+    public static byte[] Fingerprint(X509Certificate2 cert) => System.Security.Cryptography.SHA256.HashData(cert.RawData);
 
     private static X509Certificate2 CreateSelfSigned()
     {
