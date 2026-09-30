@@ -197,6 +197,22 @@ class MainActivity : ComponentActivity() {
                     status = "已保存清除策略"
                 }) { Text("保存清除策略") }
                 HorizontalDivider()
+                Button(onClick = {
+                    if (android.provider.Settings.canDrawOverlays(this@MainActivity)) {
+                        status = "悬浮窗权限已授予"
+                    } else {
+                        startActivity(
+                            android.content.Intent(
+                                android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                android.net.Uri.parse("package:" + packageName)
+                            )
+                        )
+                    }
+                }) {
+                    val overlayGranted = android.provider.Settings.canDrawOverlays(this@MainActivity)
+                    Text(if (overlayGranted) "悬浮窗权限已授予" else "授予悬浮窗权限（无 root 备用通道）")
+                }
+                HorizontalDivider()
                 Text(
                     "后台读取（PC→手机方向收到内容需读取本机剪贴板）：本应用同时是 LSPosed 模块，" +
                         "在 LSPosed 管理器中启用并勾选「系统作用域」后重启，即可后台读剪贴板；" +

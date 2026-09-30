@@ -26,7 +26,7 @@ class SyncManager(
     companion object { const val TAG = "SyncManager" }
 
     private val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    private val applier = RemoteClipApplier(cm, prefs.clearMs)
+    private val applier = RemoteClipApplier(cm, prefs.clearMs, context = context, onStatus = { s -> status(s) })
     private val dedupe = DedupeWindow()
     private val handlerThread = android.os.HandlerThread("clipport-sync").apply { start() }
     private val handler = android.os.Handler(handlerThread.looper)
@@ -56,7 +56,12 @@ class SyncManager(
         try {
             if (!prefs.syncEnabled) return
             if (ClipFilter.isSelfLabeled(cm.primaryClip?.description)) return          // 防回环第1道
-            val text = MimeUtil.textOf(cm) ?: return
+            val text = MimeUtil.textOf(cm)
+            if (text == null) {
+                // 监听回调到了但读不到数据 = 后台读取被系统限制（无 hook/无焦点）
+                status("剪贴板读取受限——需启用 LSPosed 模块（系统作用域）并重启，或等待悬浮窗读取模式")
+                return
+            }
             if (text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return // 防回声
             val htmlText = cm.primaryClip?.let { if (it.itemCount > 0) it.getItemAt(0).htmlText?.toString() else null }
             val payload = ClipPayload(text, htmlText, null)
@@ -197,6 +202,35 @@ class SyncManager(
             if (prefs.serverFpHex != null) "已连接到 PC，等待剪切板…"
             else "已连接但未配对——请输入 PC 的配对码后点「配对」"
         )
+        probeClipboardPrivilege()
+    }
+
+    /** 连接后自检剪贴板读写特权（hook 或焦点），结果上状态栏；顺带恢复原剪贴板。 */
+    private fun probeClipboardPrivilege() {
+        handler.post {
+            val saved = try { cm.primaryClip?.getItemAt(0)?.coerceToText(null)?.toString() } catch (_: Exception) { null }
+            val probeText = "__clipport_probe_${System.currentTimeMillis() / 1000 % 100000}__"
+            val writeOk = try {
+                cm.setPrimaryClip(
+                    android.content.ClipData(
+                        android.content.ClipDescription(ClipConst.SELF_LABEL, arrayOf("text/plain")),
+                        android.content.ClipData.Item(probeText)
+                    )
+                )
+                true
+            } catch (_: Exception) { false }
+            val readBack = try { cm.primaryClip?.getItemAt(0)?.text?.toString() } catch (_: Exception) { null }
+            val privileged = writeOk && readBack == probeText
+            try {
+                if (privileged) {
+                    if (saved != null) applier.apply(saved, null, null) else cm.clearPrimaryClip()
+                }
+            } catch (_: Exception) { }
+            status(
+                if (privileged) "剪贴板特权正常（hook 生效）"
+                else "剪贴板读写受限——请在 LSPosed 启用本模块（作用域:系统框架）并重启；或授予悬浮窗权限用降级通道"
+            )
+        }
     }
 
     override fun onDisconnected() { status("连接断开，3s 后重连"); scheduleReconnect() }

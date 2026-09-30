@@ -48,8 +48,14 @@ data class ClipPayload(
     val imagePng: ByteArray?,
 )
 
-/** 远端内容写入器（spec §5.1）：带 SELF_LABEL 写入 + 可配置自动清除（D-15）。 */
-class RemoteClipApplier(private val cm: ClipboardManager, private val clearMs: Long = ClipConst.REMOTE_CLEAR_MS) {
+/** 远端内容写入器（spec §5.1）：带 SELF_LABEL 写入 + 可配置自动清除（D-15）。
+ *  直接写入被系统拒绝（后台无焦点/非 IME）时，拉起悬浮获焦 Activity 写入兜底。 */
+class RemoteClipApplier(
+    private val cm: ClipboardManager,
+    private val clearMs: Long = ClipConst.REMOTE_CLEAR_MS,
+    private val context: Context? = null,
+    private val onStatus: (String) -> Unit = {},
+) {
     private var clearRunnable: Runnable? = null
 
     fun apply(text: String?, html: String?, imagePng: ByteArray?) {
@@ -65,12 +71,32 @@ class RemoteClipApplier(private val cm: ClipboardManager, private val clearMs: L
         for (i in 1 until items.size) clip.addItem(items[i])
         try {
             cm.setPrimaryClip(clip)
-        } catch (_: Exception) { return }
+        } catch (e: Exception) {
+            floatingWriteFallback(text, html)
+            return
+        }
         clearRunnable?.let { android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(it) }
         if (clearMs > 0) {
             val r = Runnable { clearIfOwned() }
             clearRunnable = r
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(r, clearMs)
+        }
+    }
+
+    /** 直接写入失败时：有悬浮窗权限则拉起透明 Activity 获焦写入（Android 12+ 后台写被拒的兜底）。 */
+    private fun floatingWriteFallback(text: String?, html: String?) {
+        val ctx = context ?: return
+        if (android.provider.Settings.canDrawOverlays(ctx)) {
+            try {
+                ctx.startActivity(
+                    com.clipport.app.xposed.ClipboardFloatingActivity.writeIntent(ctx, text, html)
+                )
+                onStatus("已通过悬浮窗写入剪贴板")
+            } catch (e: Exception) {
+                onStatus("悬浮窗写入失败: ${e.message}")
+            }
+        } else {
+            onStatus("写入剪贴板被系统拒绝——请启用 LSPosed 模块或在设置中授予悬浮窗权限")
         }
     }
 
