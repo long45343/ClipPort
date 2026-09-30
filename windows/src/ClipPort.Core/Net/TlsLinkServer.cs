@@ -190,7 +190,8 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     PeerHello = Hello.Decode(payload);
                     break;
                 case FrameCodec.PairReq:
-                    bool ok = _owner.OnPairRequest?.Invoke(this, payload) ?? false;
+                    var codeHash = Pairing.DecodePairReq(payload);   // ★ 此前漏了解码, 整条 protobuf 消息被当成哈希比对
+                    bool ok = _owner.OnPairRequest?.Invoke(this, codeHash) ?? false;
                     if (ok) Paired = true;   // ★ 配对成功立即标记，否则 PC 永远不会向该链接推送
                     _ = SendAsync(FrameCodec.Encode(FrameCodec.PairOk, seq,
                         Pairing.EncodePairOk(ok, _owner._cert != null ? CertManager.Fingerprint(_owner._cert) : Array.Empty<byte>())));
