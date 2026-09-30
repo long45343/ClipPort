@@ -64,7 +64,6 @@ public sealed class TlsLinkServer : IAsyncDisposable
             await link.HandshakeAsync(_cert!, ct).WaitAsync(TimeSpan.FromSeconds(15), ct);
             Log?.Invoke($"tls done ({link.TlsProtocol}) from {remote}");
             lock (_gate) { _links.RemoveAll(l => !l.Alive); _links.Add(link); }
-            OnHello?.Invoke(link, link.PeerHello);
             await link.ReadLoop(ct);   // 阻塞直到断开
         }
         catch (Exception ex) { Log?.Invoke($"link error from {remote}: {ex.Message}"); }
@@ -95,12 +94,14 @@ public sealed class TlsLinkServer : IAsyncDisposable
         }
     }
 
-    public void SendToAll(byte[] frame)
+    public int SendToAll(byte[] frame)
     {
         lock (_gate)
         {
-            foreach (var l in _links.Where(l => l.Alive && l.Paired).ToList())
+            var targets = _links.Where(l => l.Alive && l.Paired).ToList();
+            foreach (var l in targets)
                 _ = l.SendAsync(frame);
+            return targets.Count;
         }
     }
 
@@ -188,6 +189,7 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     break;
                 case FrameCodec.Hello:
                     PeerHello = Hello.Decode(payload);
+                    _owner.OnHello?.Invoke(this, PeerHello);   // ★ 设备ID就绪后才触发, 重连方能恢复 Paired 态
                     break;
                 case FrameCodec.PairReq:
                     var codeHash = Pairing.DecodePairReq(payload);   // ★ 此前漏了解码, 整条 protobuf 消息被当成哈希比对

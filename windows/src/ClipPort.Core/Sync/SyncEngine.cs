@@ -80,8 +80,10 @@ public sealed class SyncEngine : IDisposable
         var bc = BuildBroadcast(_cfg.DeviceId, seq, needChannel, snap);
         _lastLocal = snap;
         _lastLocalAt = DateTime.UtcNow;   // TTL 180s（LocalHolder）
-        _server.SendToAll(FrameCodec.Encode(FrameCodec.ClipBroadcast, seq, bc.Encode()));
-        Log?.Invoke($"publish seq={seq} needChannel={needChannel}");
+        int n = _server.SendToAll(FrameCodec.Encode(FrameCodec.ClipBroadcast, seq, bc.Encode()));
+        Log?.Invoke(n > 0
+            ? $"publish seq={seq} needChannel={needChannel} → 已推送至 {n} 台设备"
+            : $"publish seq={seq} 但无已配对的已连接设备，广播未送达（重连后内容仍在 180s 持有期内可拉取）");
     }
 
     private static bool SameText(ClipboardSnapshot a, ClipboardSnapshot b) =>
