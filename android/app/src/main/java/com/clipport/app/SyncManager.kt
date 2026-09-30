@@ -10,13 +10,17 @@ import com.clipport.app.clip.DedupeWindow
 import com.clipport.app.clip.MimeUtil
 import com.clipport.app.clip.RemoteClipApplier
 import com.clipport.app.protocol.*
+import com.clipport.app.transport.PeerBook
+import com.clipport.app.transport.PeerIdentity
+import com.clipport.app.transport.PeerServer
 import com.clipport.app.transport.PcDiscovery
 import com.clipport.app.transport.PcLink
 import java.security.MessageDigest
 
 /**
- * 同步总管（spec §2）：连接生命周期 / 发布·接收·去重 / 懒拉取 / 本端内容服务。
- * 线程模型：主链路跑在独立线程；剪贴板读取在 Service 注入的回调线程。
+ * 同步总管（spec §2 + 二期对等模式）：多链路连接生命周期 / 发布·接收·去重 / 懒拉取 / 本端内容服务
+ * / 服务端角色（每台设备皆可被连）/ 对称配对。
+ * 线程模型：同步逻辑在 handler 线程串行；每条链路自带读线程。
  */
 class SyncManager(
     private val context: Context,
@@ -31,12 +35,15 @@ class SyncManager(
     private val handlerThread = android.os.HandlerThread("clipport-sync").apply { start() }
     private val handler = android.os.Handler(handlerThread.looper)
 
-    @Volatile private var link: PcLink? = null
+    private val links = java.util.concurrent.CopyOnWriteArrayList<PcLink>()
+    private val peerBook by lazy { PeerBook(context) }
+    private var peerServer: PeerServer? = null
+    @Volatile private var pairingOpen = false
+    @Volatile private var pairingCodeHash: ByteArray? = null
     @Volatile private var lastEchoText: String? = null
     @Volatile private var lastEchoAt = 0L
     @Volatile private var lastLocalPayload: ClipPayload? = null
     @Volatile private var lastLocalAt = 0L
-    private var lastLocalSeq = 0L
     private val seqCounter = java.util.concurrent.atomic.AtomicLong((0 until 0x3FFFFFFF).random().toLong())
     @Volatile var pairingMode = false
 
@@ -72,13 +79,13 @@ class SyncManager(
     }
 
     private fun publish(payload: ClipPayload) {
-        val link = this.link?.takeIf { it.alive } ?: return
+        val targets = links.filter { it.alive && it.paired }
         val size = (payload.text?.length ?: 0) * 2 + (payload.html?.length ?: 0) + (payload.imagePng?.size ?: 0)
         val needChannel = size > ClipConst.LAZY_THRESHOLD_BYTES
         val seq = seqCounter.incrementAndGet()
+        if (targets.isEmpty()) { status("已编码 seq=$seq 但无已配对连接，广播未送达"); return }
         lastLocalPayload = payload
         lastLocalAt = System.currentTimeMillis()
-        lastLocalSeq = seq
         val mimes = ArrayList<Long>()
         if (payload.text != null) mimes.add(if (payload.html != null) Mime.BOTH_TEXT_HTML else Mime.TEXT)
         else if (payload.html != null) mimes.add(Mime.HTML)
@@ -94,8 +101,12 @@ class SyncManager(
                 this@apply.imagePng = payload.imagePng
             }
         }
-        link.send(FrameCodec.CLIP_BROADCAST, seq, bc.encode())
-        status("已发布 seq=$seq${if (needChannel) " (懒)" else ""}")
+        var sent = 0
+        for (l in targets) {
+            l.send(FrameCodec.CLIP_BROADCAST, seq, bc.encode())
+            sent++
+        }
+        status("已发布 seq=$seq → $sent 台设备${if (needChannel) " (懒)" else ""}")
     }
 
     // ---- PcLink.Listener ----
@@ -114,7 +125,7 @@ class SyncManager(
             if (!bc.needChannel) {
                 bc.inline?.let { text = it.text; html = it.html; image = it.imagePng }
             } else {
-                val l = link?.takeIf { it.alive } ?: return
+                val l = links.firstOrNull { it.alive && it.paired } ?: return
                 for (mime in bc.mimeCodes.distinct()) {
                     val resp = l.requestText(TextRequest().apply { seq = bc.seq; itemId = 0; this.mime = mime }) ?: continue
                     if (resp.status != 0L) continue
@@ -171,7 +182,7 @@ class SyncManager(
     }
 
     override fun onTextRequest(req: TextRequest): TextResponse {
-        // 手机作为内容源：PC 懒拉取本端最后一次复制内容（180s 持有）
+        // 本端作为内容源：对端懒拉取最后一次复制内容（180s 持有）
         val resp = TextResponse().apply { seq = req.seq; itemId = req.itemId; mime = req.mime }
         val p = lastLocalPayload ?: return resp.apply { status = 1 }
         if (System.currentTimeMillis() - lastLocalAt > 180_000) return resp.apply { status = 1 }
@@ -184,23 +195,60 @@ class SyncManager(
         return resp
     }
 
-    override fun onPairResult(ok: Boolean, fp: ByteArray) {
+    override fun onPeerHello(link: PcLink, hello: Hello) {
+        val id = hello.deviceId.joinToString("") { "%02x".format(it) }
+        if (peerBook.known(id)) link.paired = true
+        peerBook.upsert(id, hello.name, null, link.remoteEndpoint)
+        status("对端: ${hello.name}（${if (link.paired) "已配对" else "未配对"}）")
+    }
+
+    /** 服务端角色：收到 PAIR_REQ——配对窗口匹配或对端 TLS 指纹已登记（幂等）则放行。 */
+    override fun onPairRequest(link: PcLink, hash: ByteArray, joinerFp: ByteArray?): Boolean {
+        val codeOk = pairingOpen && pairingCodeHash != null && hash.contentEquals(pairingCodeHash)
+        val fpHex = link.peerTlsFp?.joinToString("") { b -> "%02x".format(b) }
+        val idempotent = fpHex != null && peerBook.all().any { it.certFpHex == fpHex }
+        return if (codeOk || idempotent) {
+            if (codeOk) { pairingOpen = false; pairingCodeHash = null }
+            peerBook.upsert(
+                link.peerHelloDeviceId ?: "unknown-${System.currentTimeMillis()}",
+                link.remoteName,
+                joinerFp?.joinToString("") { b -> "%02x".format(b) } ?: fpHex,
+                link.remoteEndpoint,
+            )
+            status("配对成功（本端作为服务端）")
+            true
+        } else {
+            status("收到配对请求但配对码不匹配/窗口未开启")
+            false
+        }
+    }
+
+    /** 本端作为加入方：PAIR_OK 结果处理（登记对端 + 指纹固定 + 重连）。 */
+    override fun onPairResult(link: PcLink, ok: Boolean, fp: ByteArray) {
         if (ok && fp.isNotEmpty()) {
-            prefs.serverFpHex = fp.joinToString("") { "%02x".format(it) }
+            val fpHex = fp.joinToString("") { "%02x".format(it) }
+            prefs.serverFpHex = fpHex
+            peerBook.upsert(
+                link.peerHelloDeviceId ?: "peer-${fpHex.take(12)}",
+                link.remoteName.ifEmpty { "peer" },
+                fpHex,
+                link.remoteEndpoint,
+            )
             pairingMode = false
             status("配对成功，指纹已固定")
-            // 断开信任任意证书的连接，用固定指纹重连
-            link?.close()
+            link.close()
             connect(pinned = true)
         } else {
             status("配对失败：配对码不匹配")
         }
     }
 
-    override fun onConnected() {
+    override fun onConnected(link: PcLink) {
+        if (!links.contains(link)) links.add(link)
+        if (link.outgoing && prefs.serverFpHex != null) link.paired = true
         status(
-            if (prefs.serverFpHex != null) "已连接到 PC，等待剪切板…"
-            else "已连接但未配对——请输入 PC 的配对码后点「配对」"
+            if (prefs.serverFpHex != null || link.paired) "已连接到对端，等待剪切板…"
+            else "已连接但未配对——请输入对端配对码后点「配对」"
         )
         probeClipboardPrivilege()
     }
@@ -233,13 +281,14 @@ class SyncManager(
         }
     }
 
-    override fun onDisconnected() { status("连接断开，3s 后重连"); scheduleReconnect() }
-
-    private var reconnectScheduled = false
-    private fun scheduleReconnect() {
-        if (reconnectScheduled) return
-        reconnectScheduled = true
-        handler.postDelayed({ reconnectScheduled = false; connect(pinned = prefs.serverFpHex != null) }, 3000)
+    override fun onDisconnected(link: PcLink) {
+        links.remove(link)
+        if (link.outgoing) {
+            status("连接断开，3s 后重连")
+            scheduleReconnect()
+        } else {
+            status("对端链接断开（服务端保持监听）")
+        }
     }
 
     /** BLE 自动发现 PC（D-02）：扫描广播回填 IP 后连接；BLE 不可用返回 false 走手动兜底。 */
@@ -266,31 +315,27 @@ class SyncManager(
         return ok
     }
 
-    /** 连接 PC。pairing=true 信任任意证书并发送配对请求。 */
+    /** 连接对端。pinned=true 用已固定指纹；pairingMode=true 附带配对请求。 */
     fun connect(pinned: Boolean): PcLink? {
         val host = prefs.host
         if (host.isNullOrEmpty()) return null
         handler.post {
             try {
-                link?.close()
-                val self = Hello().apply {
-                    name = android.os.Build.MODEL
-                    deviceType = 1
-                    protoVer = 1
-                    deviceId = prefs.deviceIdBytes()
-                }
-                val l = PcLink(
+                val self = selfHello()
+                val l = PcLink.client(
                     host, prefs.port,
                     pinnedFp = prefs.serverFpHex?.hexToBytes(),
-                    self = self, listener = this,
+                    self = self,
+                    ownFp = PeerIdentity.fingerprint(context),
+                    listener = this,
                     onStep = { step -> status(step) },
                 )
-                link = l
-                l.connect(trustAny = !pinned)
+                links.add(l)
                 if (pairingMode) {
                     val codeHash = MessageDigest.getInstance("SHA-256")
                         .digest("clipport:${prefs.pairingCode}".toByteArray(Charsets.UTF_8))
-                    l.send(FrameCodec.PAIR_REQ, seqCounter.incrementAndGet(), Pairing.encodePairReq(codeHash))
+                    l.send(FrameCodec.PAIR_REQ, seqCounter.incrementAndGet(),
+                        Pairing.encodePairReq(codeHash, PeerIdentity.fingerprint(context)))
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "connect failed", e)
@@ -298,12 +343,43 @@ class SyncManager(
                 scheduleReconnect()
             }
         }
-        return link
+        return null
+    }
+
+    private fun selfHello() = Hello().apply {
+        name = android.os.Build.MODEL
+        deviceType = 1
+        protoVer = 1
+        deviceId = prefs.deviceIdBytes()
+    }
+
+    private var reconnectScheduled = false
+    private fun scheduleReconnect() {
+        if (reconnectScheduled) return
+        reconnectScheduled = true
+        handler.postDelayed({ reconnectScheduled = false; connect(pinned = prefs.serverFpHex != null) }, 3000)
     }
 
     fun disconnect() {
-        link?.close()
-        link = null
+        links.forEach { it.close() }
+        links.clear()
+        peerServer?.stop()
+    }
+
+    /** 开启配对窗口（本端作为服务端被连方）。返回 6 位码。 */
+    fun openPairing(): String {
+        val code = (100000..999999).random().toString()
+        pairingCodeHash = MessageDigest.getInstance("SHA-256")
+            .digest("clipport:$code".toByteArray(Charsets.UTF_8))
+        pairingOpen = true
+        return code
+    }
+
+    /** 二期: 启动对等服务端（每台设备皆可被连）。 */
+    fun startServerRole() {
+        if (peerServer?.running == true) return
+        peerServer = PeerServer(context, selfHello(), PeerIdentity.fingerprint(context), this) { s -> status(s) }
+            .also { it.start() }
     }
 }
 

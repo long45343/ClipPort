@@ -228,37 +228,41 @@ class Hello {
 }
 
 object Pairing {
-    fun encodePairReq(codeHash: ByteArray): ByteArray {
+    /** PAIR_REQ{codeHash=1, joinerFp=2(二期:加入方证书指纹,可空)}。 */
+    fun encodePairReq(codeHash: ByteArray, joinerFp: ByteArray? = null): ByteArray {
         val o = ArrayList<Byte>()
         Proto.bytes(o, 1, codeHash)
+        joinerFp?.let { Proto.bytes(o, 2, it) }
         return o.toByteArray()
     }
 
-    fun decodePairReq(p: ByteArray): ByteArray {
+    fun decodePairReq(p: ByteArray): Pair<ByteArray, ByteArray?> {
+        var hash = ByteArray(0); var jfp: ByteArray? = null
         val r = Proto.Reader(p)
         while (true) {
             val (f, wt) = r.readTag() ?: break
-            if (f == 1) return r.bytes()
-            r.skip(wt)
+            when (f) { 1 -> hash = r.bytes(); 2 -> jfp = r.bytes(); else -> r.skip(wt) }
         }
-        return ByteArray(0)
+        return hash to jfp
     }
 
-    fun encodePairOk(ok: Boolean, certFp: ByteArray): ByteArray {
+    /** PAIR_OK{ok=1, certFp=2, name=3(二期)}。 */
+    fun encodePairOk(ok: Boolean, certFp: ByteArray, name: String = ""): ByteArray {
         val o = ArrayList<Byte>()
         Proto.bool(o, 1, ok)
         Proto.bytes(o, 2, certFp)
+        Proto.string(o, 3, name)
         return o.toByteArray()
     }
 
-    fun decodePairOk(p: ByteArray): Pair<Boolean, ByteArray> {
-        var ok = false; var fp = ByteArray(0)
+    fun decodePairOk(p: ByteArray): Triple<Boolean, ByteArray, String> {
+        var ok = false; var fp = ByteArray(0); var name = ""
         val r = Proto.Reader(p)
         while (true) {
             val (f, wt) = r.readTag() ?: break
-            when (f) { 1 -> ok = r.bool(); 2 -> fp = r.bytes(); else -> r.skip(wt) }
+            when (f) { 1 -> ok = r.bool(); 2 -> fp = r.bytes(); 3 -> name = r.string(); else -> r.skip(wt) }
         }
-        return ok to fp
+        return Triple(ok, fp, name)
     }
 }
 
