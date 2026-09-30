@@ -1,39 +1,53 @@
-using Microsoft.UI.Xaml;
+using System.ComponentModel;
+using System.Windows;
+using Wpf.Ui.Controls;
+using Wpf.Ui.Tray.Controls;
 
 namespace ClipPort.App;
 
-public sealed partial class MainWindow : Window
+public partial class MainWindow : FluentWindow
 {
-    private bool _closingToTray;
+    private bool _realExit;
 
     public MainWindow()
     {
         InitializeComponent();
         Title = $"ClipPort v{GetType().Assembly.GetName().Version?.ToString(3)}";
-        AppWindow.Closing += (s, e) =>
-        {
-            if (!_closingToTray)
-            {
-                e.Cancel = true;
-                HideToTray();
-            }
-        };
     }
 
-    public void HideToTray() { _closingToTray = true; AppWindow.Hide(); _closingToTray = false; }
-    public void ShowFromTray() { AppWindow.Show(); Activate(); }
-    /// <summary>退出前真正关闭（绕过"关闭=收托盘"拦截）。</summary>
-    public void CloseForExit() { _closingToTray = true; Close(); }
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (!_realExit)
+        {
+            e.Cancel = true;
+            Hide();
+            return;
+        }
+        base.OnClosing(e);
+    }
+
+    public void ShowFromTray()
+    {
+        Show();
+        WindowState = WindowState.Normal;
+        Activate();
+    }
 
     public void SetStatus(string s) => StatusText.Text = s;
-
-    public void SetLocalIp(string s) => LocalIpText.Text = "本机地址: " + s;
+    public void SetLocalIp(string s) => LocalIpText.Text = s;
 
     public void AppendLog(string msg)
     {
         LogList.Items.Add($"[{DateTime.Now:HH:mm:ss}] {msg}");
         while (LogList.Items.Count > 200) LogList.Items.RemoveAt(0);
         LogList.ScrollIntoView(LogList.Items[^1]);
+    }
+
+    private void PairBtn_Click(object sender, RoutedEventArgs e)
+    {
+        App.Instance!.OpenPairing(out var code);
+        PairCodeText.Text = code;
+        AppendLog("配对码已生成，请在其他设备端输入连接");
     }
 
     private void ConnectPeer_Click(object sender, RoutedEventArgs e)
@@ -45,16 +59,35 @@ public sealed partial class MainWindow : Window
         App.Instance!.ConnectToPeer(host, port, code.Length == 6 ? code : null);
     }
 
-    private void PairBtn_Click(object sender, RoutedEventArgs e)
+    private void SyncToggle_Click(object sender, RoutedEventArgs e)
     {
-        App.Instance!.OpenPairing(out var code);
-        PairCodeText.Text = code;
-        AppendLog($"配对码已生成，请在手机端输入（IP 见下方日志）");
+        var isChecked = SyncToggle.IsChecked ?? true;
+        App.Instance!.Config.SyncEnabled = isChecked;
+        App.Instance.Config.Save();
+        TraySyncMenuItem.IsChecked = isChecked;
     }
 
-    private void SyncToggle_Toggled(object sender, RoutedEventArgs e)
+    private void RootNotifyIcon_LeftClick(NotifyIcon sender, RoutedEventArgs e)
     {
-        App.Instance!.Config.SyncEnabled = SyncToggle.IsOn;
+        ShowFromTray();
+    }
+
+    private void OpenMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        ShowFromTray();
+    }
+
+    private void SyncMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        var isChecked = TraySyncMenuItem.IsChecked;
+        SyncToggle.IsChecked = isChecked;
+        App.Instance!.Config.SyncEnabled = isChecked;
         App.Instance.Config.Save();
+    }
+
+    private void ExitMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        _realExit = true;
+        App.Instance!.ShutdownApp();
     }
 }

@@ -124,7 +124,7 @@
 - **A) C# / .NET 8 WinForms 托盘应用（P/Invoke 剪贴板）** — 优：你熟 C#，AddClipboardFormatListener 一组 P/Invoke 就够，self-contained 单 exe 发布；劣：需带运行时（~70MB，可裁剪）
 - **B) C++ Win32** — 优：零运行时依赖、与小米同路（可直接对照其 dist_clipboard 设计）；劣：开发效率低，COM/内存管理细节坑多
 - **C) Rust（windows-rs）** — 优：内存安全 + 单文件体积小；劣：学习/迭代成本最高，GUI 生态一般
-- 选择：**C# / .NET 10 + WinUI 3（Windows App SDK），NativeAOT/ReadyToRun 性能优化**（2026-09-30，用户指定；同日由 .NET 8 升级为 .NET 10 LTS）
+- 选择：**C# / .NET 10 + WPF-UI 4.3 现代 Fluent 框架**（2026-09-30；原定 WinUI3 因单文件自解压闪退、Win10缺失运行时且多文件体积过大等限制，由用户决策重构为 WPF-UI；实现真正单文件 EXE、Win10/11 完美兼容 Mica/亚克力、体积大降 60%、零依赖开箱即用）
 
 ## D-14 Windows 懒加载呈现方式 ⚠️ 依赖 D-06
 - 状态：✅

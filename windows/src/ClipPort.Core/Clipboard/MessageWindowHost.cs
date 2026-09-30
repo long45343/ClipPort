@@ -65,7 +65,7 @@ public static class MessageWindowHost
         {
             lpfnWndProc = Marshal.GetFunctionPointerForDelegate(proc),
             lpszClassName = className,
-            hInstance = Marshal.GetHINSTANCE(typeof(MessageWindowHost).Module),
+            hInstance = Native.GetModuleHandleW(null),
         };
         _ = Native.RegisterClassW(ref wc);
         // 同名类已注册（重复启动）→ RegisterClass 失败也继续，CreateWindow 仍可用

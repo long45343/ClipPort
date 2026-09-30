@@ -51,6 +51,9 @@ internal static class Native
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr GlobalFree(IntPtr hMem);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr GetModuleHandleW(string? moduleName);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CreateWindowExW(uint exStyle, string cls, string window, uint style,
         int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);

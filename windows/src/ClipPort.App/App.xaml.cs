@@ -1,122 +1,93 @@
-using Microsoft.UI.Dispatching;
+using System.IO;
 using System.Security.Cryptography.X509Certificates;
-using Microsoft.UI.Xaml;
-using ClipPort.Core.Net;
-using System.Net;
-using ClipPort.Core.Sync;
+using System.Windows;
 using ClipPort.Core.Clipboard;
+using ClipPort.Core.Net;
+using ClipPort.Core.Sync;
 
 namespace ClipPort.App;
 
 public partial class App : Application
 {
-    public static App? Instance;
-    public AppConfig Config = null!;
-    public SyncEngine? Engine;
-    public TlsLinkServer? Server;
+    public static App? Instance { get; private set; }
+    public AppConfig Config { get; private set; } = null!;
+    public SyncEngine? Engine { get; private set; }
+    public TlsLinkServer? Server { get; private set; }
+
     private ClipboardListener? _listener;
-    private TrayIcon? _tray;
     private MainWindow? _main;
-    public DispatcherQueue UiQueue = null!;
     private static Mutex? _singleInstance;
+    private X509Certificate2? _ownCert;
 
-    public App()
+    protected override void OnStartup(StartupEventArgs e)
     {
+        base.OnStartup(e);
         Instance = this;
-        InitializeComponent();
-    }
 
-    protected override void OnLaunched(LaunchActivatedEventArgs args)
-    {
-        try
-        {
-            OnLaunchedInner(args);
-        }
-        catch (Exception ex)
-        {
-            System.IO.File.WriteAllText(
-                System.IO.Path.Combine(ClipPort.Core.Net.CertManager.StoreDir, "startup-crash.log"),
-                ex.ToString());
-            throw;
-        }
-    }
-
-    private void OnLaunchedInner(LaunchActivatedEventArgs args)
-    {
-        // 单实例互斥（spec §4）：防止新旧实例托盘图标并存造成"点了没反应"的假象
+        // 1. 单实例互斥
         _singleInstance = new Mutex(true, "ClipPort.SingleInstance", out var createdNew);
         if (!createdNew)
         {
-            UiQueue = DispatcherQueue.GetForCurrentThread();
-            Exit();
+            Shutdown();
             return;
         }
 
-        UiQueue = DispatcherQueue.GetForCurrentThread();
-        Config = AppConfig.Load();
-        _ownCert = CertManager.GetOrCreate();
-
-        Server = new TlsLinkServer();
-        Engine = new SyncEngine(Config, Server) { Log = OnEngineLog, StatusChanged = OnStatus };
-        Engine.OwnFpProvider = () => System.Security.Cryptography.SHA256.HashData(_ownCert.RawData);
-        Server.Log = OnEngineLog;
-        Server.OwnHelloProvider = () => new Core.Protocol.Hello
+        try
         {
-            Name = Config.DeviceName,
-            DeviceType = 0,
-            ProtoVer = 1,
-            DeviceId = Convert.FromHexString(Config.DeviceId),
-        };
-        _listener = new ClipboardListener();
-        _listener.ClipChanged += () => Engine.OnLocalClipChanged();
-        _listener.Start();
+            Config = AppConfig.Load();
+            _ownCert = CertManager.GetOrCreate();
 
-        _tray = new TrayIcon();
-        _tray.Click += ShowMain;
-        _tray.SyncEnabledState = () => Config.SyncEnabled;
-        _tray.SyncToggle += () => UiQueue.TryEnqueue(() =>
+            Server = new TlsLinkServer();
+            Engine = new SyncEngine(Config, Server)
+            {
+                Log = OnEngineLog,
+                StatusChanged = OnStatus,
+                OwnFpProvider = () => System.Security.Cryptography.SHA256.HashData(_ownCert.RawData)
+            };
+            Server.Log = OnEngineLog;
+            Server.OwnHelloProvider = () => new Core.Protocol.Hello
+            {
+                Name = Config.DeviceName,
+                DeviceType = 0,
+                ProtoVer = 1,
+                DeviceId = Convert.FromHexString(Config.DeviceId),
+            };
+
+            _listener = new ClipboardListener();
+            _listener.ClipChanged += () => Engine.OnLocalClipChanged();
+            _listener.Start();
+
+            _main = new MainWindow();
+            MainWindow = _main;
+
+            StartServer();
+            ReconnectKnownPeers();
+
+            if (e.Args.Any(a => a.Equals("--minimized", StringComparison.OrdinalIgnoreCase)))
+            {
+                _main.Hide();
+            }
+            else
+            {
+                _main.Show();
+            }
+        }
+        catch (Exception ex)
         {
-            Config.SyncEnabled = !Config.SyncEnabled;
-            Config.Save();
-        });
-        _tray.ExitRequested += () => UiQueue.TryEnqueue(ShutdownApp);
-
-        // 若被配对设备拉起（BLE 广播发现入口），v1 常开监听
-        StartServer();
-
-        ReconnectKnownPeers();
-
-        _main = new MainWindow();
-        _main.Activate();
-        // 仅带 --minimized（开机自启）时收进托盘；正常启动保持窗口可见
-        if (Environment.GetCommandLineArgs().Any(a => a.Equals("--minimized", StringComparison.OrdinalIgnoreCase)))
-            _main.HideToTray();
+            File.WriteAllText(Path.Combine(CertManager.StoreDir, "startup-crash.log"), ex.ToString());
+            MessageBox.Show($"ClipPort 启动失败: {ex.Message}", "ClipPort 错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            Shutdown();
+        }
     }
-
-    private void ShutdownApp()
-    {
-        _main?.CloseForExit();
-        _tray?.Dispose();
-        Engine?.Dispose();
-        Server?.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2));
-        _listener?.Dispose();
-        _singleInstance?.ReleaseMutex();
-        Exit();
-    }
-
-    private X509Certificate2? _ownCert;
 
     private void StartServer()
     {
         try
         {
-            var cert = CertManager.GetOrCreate();
+            var cert = _ownCert ?? CertManager.GetOrCreate();
             _ownCert = cert;
             Server!.Start(Config.TcpPort, cert);
-            // 注意：不再清除 PairingCodeHash/PairingOpen——配对窗口跨重启有效，
-            // 否则每次更新重启后手机用界面上的码配对会永远失败
             var fp = CertManager.Fingerprint(cert);
-            // BLE 常驻广播（D-02）：手机扫描后自动回填 IP 连入，无需手动输入
             try
             {
                 BlePublisher.StatusLog = OnEngineLog;
@@ -125,8 +96,8 @@ public partial class App : Application
             catch (Exception ex) { OnEngineLog("ble 广播不可用: " + ex.Message); }
             var ips = BlePublisher.AllLanIpv4().Select(a => a.ToString()).ToList();
             var addrText = string.Join("  ", ips.Select(ip => $"{ip}:{Config.TcpPort}"));
-            OnEngineLog($"本机地址: {addrText}（手机自动发现中，也可手动填写）");
-            UiQueue.TryEnqueue(() => _main?.SetLocalIp(addrText));
+            OnEngineLog($"本机地址: {addrText}（UDP广播与BLE发现运行中）");
+            Dispatcher.BeginInvoke(() => _main?.SetLocalIp(addrText));
         }
         catch (Exception ex) { OnEngineLog("server start failed: " + ex.Message); }
     }
@@ -138,7 +109,6 @@ public partial class App : Application
         OnEngineLog($"正在连接对端 {host}:{port}…");
     }
 
-    /// <summary>启动后自动重连已知对端（二期自动组网）。</summary>
     public void ReconnectKnownPeers() => Engine?.ReconnectKnownPeers();
 
     public void OpenPairing(out string code)
@@ -147,17 +117,19 @@ public partial class App : Application
         Config.PairingCodeHash = AppConfig.CodeHash(code);
         Config.PairingOpen = true;
         Config.Save();
-        OnEngineLog($"配对窗口已开启（跨重启有效），code={code} hash={Convert.ToHexString(Config.PairingCodeHash)[..16]}…");
+        OnEngineLog($"配对窗口已开启，code={code}");
     }
 
-    private void OnEngineLog(string msg) => UiQueue.TryEnqueue(() => _main?.AppendLog(msg));
-
-    private void OnStatus(string s) => UiQueue.TryEnqueue(() =>
+    public void ShutdownApp()
     {
-        _main?.SetStatus(s);
-        _tray?.ShowBalloon("ClipPort", s);
-    });
+        _listener?.Dispose();
+        Engine?.Dispose();
+        Server?.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2));
+        _singleInstance?.ReleaseMutex();
+        Shutdown();
+    }
 
-    /// <summary>托盘回调在消息泵线程触发，必须切回 UI 线程操作 XAML（托盘点不开窗口的修复）。</summary>
-    private void ShowMain() => UiQueue.TryEnqueue(() => _main?.ShowFromTray());
+    private void OnEngineLog(string msg) => Dispatcher.BeginInvoke(() => _main?.AppendLog(msg));
+
+    private void OnStatus(string s) => Dispatcher.BeginInvoke(() => _main?.SetStatus(s));
 }
