@@ -22,6 +22,13 @@ object ClipFilter {
     fun isSelfLabeled(desc: ClipDescription?): Boolean =
         desc?.label?.toString() == ClipConst.SELF_LABEL
 
+    /** 对齐小米 UniversalClipDataPublisher：比对系统时间戳，阻断相同时间戳的重复空回调 */
+    fun isSameTimestamp(desc: ClipDescription?, lastTimestamp: Long): Boolean {
+        if (desc == null || lastTimestamp <= 0L) return false
+        val ts = desc.timestamp
+        return ts > 0L && ts == lastTimestamp
+    }
+
     fun isEcho(cm: ClipboardManager, lastText: String?, lastAt: Long): Boolean {
         if (System.currentTimeMillis() - lastAt > ClipConst.ECHO_WINDOW_MS) return false
         val clip = cm.primaryClip ?: return false

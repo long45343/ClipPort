@@ -43,6 +43,7 @@ class SyncManager(
     @Volatile private var pairingCodeHash: ByteArray? = null
     @Volatile private var lastEchoText: String? = null
     @Volatile private var lastEchoAt = 0L
+    @Volatile private var lastClipTimestamp = 0L
     @Volatile private var lastLocalPayload: ClipPayload? = null
     @Volatile private var lastLocalAt = 0L
     private val seqCounter = java.util.concurrent.atomic.AtomicLong((0 until 0x3FFFFFFF).random().toLong())
@@ -86,13 +87,15 @@ class SyncManager(
         try {
             if (!prefs.syncEnabled) return
             val primary = cm.primaryClip ?: return
-            if (ClipFilter.isSelfLabeled(primary.description)) return // 防回环第1道
+            val desc = primary.description
+            if (ClipFilter.isSelfLabeled(desc)) return // 防回环第1道：私有标签
+            if (ClipFilter.isSameTimestamp(desc, lastClipTimestamp)) return // 防重复第2道：系统时间戳未变阻断（对齐小米 UniversalClipDataPublisher）
 
             // D-25=A: 过滤常规纯文件。若仅含非图片 URI，严格静默忽略
             if (primary.itemCount > 0 && primary.getItemAt(0).uri != null) {
                 val uri = primary.getItemAt(0).uri
                 val mime = context.contentResolver.getType(uri)
-                    ?: (if (primary.description.mimeTypeCount > 0) primary.description.getMimeType(0) else "")
+                    ?: (if (desc.mimeTypeCount > 0) desc.getMimeType(0) else "")
                 if (!mime.startsWith("image/")) {
                     return // 纯文件，静默忽略
                 }
@@ -107,7 +110,11 @@ class SyncManager(
                 status("剪贴板读取受限——需启用 LSPosed 模块（系统作用域）并重启，或等待悬浮窗读取模式")
                 return
             }
-            if (text != null && text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return // 防回声
+            if (text != null && text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return // 防回声第3道
+
+            if (desc != null && desc.timestamp > 0) {
+                lastClipTimestamp = desc.timestamp
+            }
 
             val payload = ClipPayload(text, htmlText, imagePng)
             publish(payload)
