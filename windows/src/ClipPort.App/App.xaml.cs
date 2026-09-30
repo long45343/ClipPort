@@ -98,7 +98,8 @@ public partial class App : Application
         {
             var cert = CertManager.GetOrCreate();
             Server!.Start(Config.TcpPort, cert);
-            Config.PairingCodeHash = null;
+            // 注意：不再清除 PairingCodeHash/PairingOpen——配对窗口跨重启有效，
+            // 否则每次更新重启后手机用界面上的码配对会永远失败
             var fp = CertManager.Fingerprint(cert);
             // BLE 常驻广播（D-02）：手机扫描后自动回填 IP 连入，无需手动输入
             try { BlePublisher.Start(Config.TcpPort, fp); } catch (Exception ex) { OnEngineLog("ble 广播不可用: " + ex.Message); }
@@ -116,7 +117,7 @@ public partial class App : Application
         Config.PairingCodeHash = AppConfig.CodeHash(code);
         Config.PairingOpen = true;
         Config.Save();
-        // 手机在配对成功后广播 BLE；PC 侧 v1 由手机直连 IP 完成配对
+        OnEngineLog($"配对窗口已开启（跨重启有效），code={code} hash={Convert.ToHexString(Config.PairingCodeHash)[..16]}…");
     }
 
     private void OnEngineLog(string msg) => UiQueue.TryEnqueue(() => _main?.AppendLog(msg));

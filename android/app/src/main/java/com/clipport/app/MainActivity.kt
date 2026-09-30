@@ -209,7 +209,8 @@ class MainActivity : ComponentActivity() {
 
     /** 配对：权限落定 → saveAndPair 启动服务并发 PAIR_REQ。 */
     private fun saveAndPair() {
-        prefs.host = host.trim()
+        // 自动发现已写入 host 而输入框为空时，不得覆盖（否则连接因无地址而静默失效）
+        if (host.isNotBlank()) prefs.host = host.trim()
         prefs.port = port.toIntOrNull() ?: 47190
         prefs.serverFpHex = null
         paired = false

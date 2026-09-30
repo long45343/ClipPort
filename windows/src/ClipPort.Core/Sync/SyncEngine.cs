@@ -230,8 +230,16 @@ public sealed class SyncEngine : IDisposable
             StatusChanged?.Invoke("paired (idempotent)");
             return true;
         }
-        if (!_cfg.PairingOpen || _cfg.PairingCodeHash is null) return false;
-        if (!codeHash.AsSpan().SequenceEqual(_cfg.PairingCodeHash)) return false;
+        if (!_cfg.PairingOpen || _cfg.PairingCodeHash is null)
+        {
+            Log?.Invoke($"pair rejected: 窗口未开启或已失效 (open={_cfg.PairingOpen}, hashNull={_cfg.PairingCodeHash is null})");
+            return false;
+        }
+        if (!codeHash.AsSpan().SequenceEqual(_cfg.PairingCodeHash))
+        {
+            Log?.Invoke($"pair rejected: 码不匹配 got={Convert.ToHexString(codeHash)[..16]}… expected={Convert.ToHexString(_cfg.PairingCodeHash)[..16]}…");
+            return false;
+        }
         _cfg.PairingOpen = false;
         _cfg.PairedPhoneId = Convert.ToHexString(link.PeerHello.DeviceId);
         _cfg.Save();
