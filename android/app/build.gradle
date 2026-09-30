@@ -4,6 +4,12 @@ plugins {
     id "org.jetbrains.kotlin.plugin.compose"
 }
 
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace "com.clipport.app"
     compileSdk 35
@@ -20,9 +26,25 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
     buildTypes {
         release {
-            minifyEnabled false
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
         }
     }
     compileOptions {
@@ -54,7 +76,6 @@ dependencies {
     implementation "androidx.compose.material3:material3"
     implementation "androidx.compose.ui:ui-tooling-preview"
     compileOnly "io.github.libxposed:api:102.0.0"
-    implementation "org.bouncycastle:bcpkix-jdk15to18:1.78.1"
 
     // CameraX + ZXing 轻量扫码（纯 Java 零 SO 库）
     def camerax_version = "1.3.4"
