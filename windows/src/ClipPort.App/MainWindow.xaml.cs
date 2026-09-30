@@ -9,7 +9,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Title = "ClipPort";
+        Title = $"ClipPort v{GetType().Assembly.GetName().Version?.ToString(3)}";
         AppWindow.Closing += (s, e) =>
         {
             if (!_closingToTray)
