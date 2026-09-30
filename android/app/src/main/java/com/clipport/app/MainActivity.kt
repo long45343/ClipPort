@@ -76,10 +76,9 @@ class MainActivity : ComponentActivity() {
         // 服务状态实时回显（服务在后台持续更新 ClipPortService.statusText）
         val poll = object : Runnable {
             override fun run() {
-                if (ClipPortService.running && ClipPortService.statusText.isNotBlank()) {
-                    if (status != ClipPortService.statusText && !status.startsWith("配对中") && !status.startsWith("发现中"))
-                        status = ClipPortService.statusText
-                }
+                // 无条件镜像服务状态：服务是状态唯一事实源，任何过滤都会造成界面冻结
+                if (ClipPortService.statusText.isNotBlank() && status != ClipPortService.statusText)
+                    status = ClipPortService.statusText
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this, 1000)
             }
         }
@@ -155,8 +154,8 @@ class MainActivity : ComponentActivity() {
                         prefs.pairingCode = code
                         prefs.serverFpHex = null
                         paired = false
-                        status = "配对中…"
                         ClipPortService.statusText = "配对中…"
+                        status = "配对中…"
                         requestEssentialPermissions(then = "pair")
                     }, enabled = code.length == 6) {
                         Text(if (paired) "重新配对" else "配对")

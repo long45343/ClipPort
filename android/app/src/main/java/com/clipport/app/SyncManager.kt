@@ -192,7 +192,12 @@ class SyncManager(
         }
     }
 
-    override fun onConnected() { status("已连接到 PC") }; // pairing 发生在 connect() 内部
+    override fun onConnected() {
+        status(
+            if (prefs.serverFpHex != null) "已连接到 PC，等待剪切板…"
+            else "已连接但未配对——请输入 PC 的配对码后点「配对」"
+        )
+    }
 
     override fun onDisconnected() { status("连接断开，3s 后重连"); scheduleReconnect() }
 

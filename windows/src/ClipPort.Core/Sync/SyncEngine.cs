@@ -222,6 +222,14 @@ public sealed class SyncEngine : IDisposable
 
     private bool OnPairRequest(Net.TlsLinkServer.PhoneLink link, byte[] codeHash)
     {
+        // 幂等：已配对设备再次发起配对（重装/换码后重试）直接放行
+        var helloId = Convert.ToHexString(link.PeerHello.DeviceId);
+        if (!string.IsNullOrEmpty(_cfg.PairedPhoneId) &&
+            string.Equals(_cfg.PairedPhoneId, helloId, StringComparison.OrdinalIgnoreCase))
+        {
+            StatusChanged?.Invoke("paired (idempotent)");
+            return true;
+        }
         if (!_cfg.PairingOpen || _cfg.PairingCodeHash is null) return false;
         if (!codeHash.AsSpan().SequenceEqual(_cfg.PairingCodeHash)) return false;
         _cfg.PairingOpen = false;
