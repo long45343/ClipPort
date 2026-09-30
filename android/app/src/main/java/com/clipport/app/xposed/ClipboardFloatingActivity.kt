@@ -40,9 +40,13 @@ class ClipboardFloatingActivity : Activity() {
             } else {
                 // ── 读模式：获焦状态下读取 ──
                 val clip = cm.primaryClip
-                val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this)?.toString() else null
-                Log.i("ClipPortFallback", "floating read ok len=${text?.length ?: 0}")
-                text?.let { BackgroundClipboardCache.offer(it) }
+                if (clip != null && clip.itemCount > 0 && !com.clipport.app.clip.ClipFilter.isSelfLabeled(clip.description)) {
+                    val text = clip.getItemAt(0).coerceToText(this)?.toString()
+                    val html = clip.getItemAt(0).htmlText?.toString()
+                    Log.i("ClipPortFallback", "floating read ok len=${text?.length ?: 0}")
+                    text?.let { BackgroundClipboardCache.offer(it) }
+                    FloatingClipboardBridge.dispatch(text, html)
+                }
             }
         } catch (e: Exception) {
             Log.w("ClipPortFallback", "floating op failed", e)
@@ -61,6 +65,23 @@ class ClipboardFloatingActivity : Activity() {
 
         fun writeIntent(context: Context, text: String?, html: String?): Intent =
             intent(context).putExtra(EXTRA_WRITE_TEXT, text ?: "").putExtra(EXTRA_WRITE_HTML, html ?: "")
+    }
+}
+
+/** 进程内悬浮窗读取结果桥接（D-20=A 决策：单例内存直传） */
+object FloatingClipboardBridge {
+    private var callback: ((text: String?, html: String?) -> Unit)? = null
+
+    fun register(cb: (text: String?, html: String?) -> Unit) {
+        callback = cb
+    }
+
+    fun unregister() {
+        callback = null
+    }
+
+    internal fun dispatch(text: String?, html: String?) {
+        callback?.invoke(text, html)
     }
 }
 

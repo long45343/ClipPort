@@ -30,6 +30,7 @@ public sealed class TlsLinkServer : IAsyncDisposable
     /// <summary>手机间中继开关（多设备同步：A 手机的内容转发给其他已配对链接）。</summary>
     public bool RelayEnabled { get; set; } = true;
     public Func<TextRequest, TextResponse>? OnTextRequest { get; set; }
+    public Action<FileShareChunk>? OnFileShareChunk { get; set; }
     public Action<string>? Log { get; set; }
 
     public bool HasConnectedPhone => _links.Count > 0;
@@ -73,7 +74,11 @@ public sealed class TlsLinkServer : IAsyncDisposable
             lock (_gate) { _links.RemoveAll(l => !l.Alive); _links.Add(link); }
             await link.ReadLoop(ct);   // 阻塞直到断开
         }
-        catch (Exception ex) { Log?.Invoke($"link error from {remote}: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            var detail = ex.InnerException != null ? $"{ex.Message} ({ex.InnerException.Message})" : ex.Message;
+            Log?.Invoke($"link error from {remote}: {detail}");
+        }
         finally
         {
             lock (_gate) _links.Remove(link);
@@ -102,7 +107,8 @@ public sealed class TlsLinkServer : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Log?.Invoke($"connect-out failed to {host}:{port}: {ex.Message}");
+            var detail = ex.InnerException != null ? $"{ex.Message} ({ex.InnerException.Message})" : ex.Message;
+            Log?.Invoke($"connect-out failed to {host}:{port}: {detail}");
             link.Dispose();
             throw;
         }
@@ -301,6 +307,10 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     var resp2 = _owner.OnTextRequest?.Invoke(TextRequest.Decode(payload))
                                ?? new TextResponse { Status = 1 };
                     _ = SendAsync(FrameCodec.Encode(FrameCodec.RespText, seq, resp2.Encode()));
+                    break;
+                case FrameCodec.FileShareChunk:
+                    var chunk = FileShareChunk.Decode(payload);
+                    _owner.OnFileShareChunk?.Invoke(chunk);
                     break;
             }
         }

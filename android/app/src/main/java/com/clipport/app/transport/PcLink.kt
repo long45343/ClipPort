@@ -40,21 +40,23 @@ class PcLink private constructor(
         fun onPeerHello(link: PcLink, hello: Hello)
         /** 服务端角色：收到 PAIR_REQ（返回是否接受配对）。 */
         fun onPairRequest(link: PcLink, hash: ByteArray, joinerFp: ByteArray?): Boolean
+        fun onFileShareChunk(chunk: FileShareChunk) {}
     }
 
     companion object {
-        /** 主动连出（client 模式）。 */
+        /** 主动连出（client 模式）。trustAny 用于首次配对模式（TOFU 临时建立通道以发起 PAIR_REQ 挑战）。 */
         fun client(
             host: String,
             port: Int,
             pinnedFp: ByteArray?,
+            trustAny: Boolean = false,
             self: Hello,
             ownFp: ByteArray?,
             listener: Listener,
             onStep: (String) -> Unit = {},
         ): PcLink {
             val link = PcLink(self, listener, ownFp, onStep, outgoing = true)
-            link.connectClient(host, port, pinnedFp)
+            link.connectClient(host, port, pinnedFp, trustAny)
             return link
         }
 
@@ -88,13 +90,13 @@ class PcLink private constructor(
         get() = socket?.let { "${it.inetAddress?.hostAddress}:${it.port}" } ?: ""
 
     /** client 模式：连接+TLS 握手（握手期 10s 超时防永久挂起）。 */
-    private fun connectClient(host: String, port: Int, pinnedFp: ByteArray?) {
+    private fun connectClient(host: String, port: Int, pinnedFp: ByteArray?, trustAny: Boolean) {
         val plain = Socket()
         plain.tcpNoDelay = true
         plain.connect(InetSocketAddress(host, port), 5000)
         onStep("TCP 已连 $host:$port")
         val ctx = SSLContext.getInstance("TLS")
-        ctx.init(null, arrayOf(trustManager(pinnedFp)), SecureRandom())
+        ctx.init(null, arrayOf(trustManager(pinnedFp, trustAny)), SecureRandom())
         val s = ctx.socketFactory.createSocket(plain, host, port, true) as SSLSocket
         s.soTimeout = 10_000
         onStep("TLS 握手中…")
@@ -123,11 +125,16 @@ class PcLink private constructor(
         Thread({ readLoop() }, "clipport-link-read").start()
     }
 
-    private fun trustManager(pinnedFp: ByteArray?): X509TrustManager = object : X509TrustManager {
+    private fun trustManager(pinnedFp: ByteArray?, trustAny: Boolean): X509TrustManager = object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
         override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
+            if (chain.isEmpty()) throw CertificateException("empty cert chain")
+            if (trustAny) {
+                // 配对模式：放行自签证书握手，后续通过 PAIR_REQ 6 位配对码进行身份验证并固化指纹
+                return
+            }
             val fp = MessageDigest.getInstance("SHA-256").digest(chain[0].encoded)
-            if (pinnedFp == null) throw CertificateException("not paired")
+            if (pinnedFp == null) throw CertificateException("not paired (no pinned fingerprint)")
             if (!fp.contentEquals(pinnedFp)) throw CertificateException("fingerprint mismatch")
         }
         override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
@@ -191,6 +198,10 @@ class PcLink private constructor(
             FrameCodec.REQ_TEXT -> {
                 val resp = listener.onTextRequest(TextRequest.decode(payload))
                 send(FrameCodec.RESP_TEXT, seq, resp.encode())
+            }
+            FrameCodec.FILE_SHARE_CHUNK -> {
+                val chunk = FileShareChunk.decode(payload)
+                listener.onFileShareChunk(chunk)
             }
         }
     }

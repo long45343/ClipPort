@@ -270,3 +270,82 @@ public sealed class TextResponse
         return m;
     }
 }
+
+/// <summary>独立文件共享元信息（D-26=A：与剪贴板解耦）</summary>
+public sealed class FileShareMeta
+{
+    public string FileName = "";
+    public ulong FileSize;
+    public byte[] Sha256 = Array.Empty<byte>();
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>();
+        Proto.WriteString(o, 1, FileName);
+        Proto.WriteUint(o, 2, (uint)(FileSize & 0xFFFFFFFF));
+        Proto.WriteUint(o, 3, (uint)(FileSize >> 32));
+        Proto.WriteBytes(o, 4, Sha256);
+        return o.ToArray();
+    }
+
+    public static FileShareMeta Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new FileShareMeta();
+        uint low = 0, high = 0;
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f)
+            {
+                case 1: m.FileName = r.ReadString(); break;
+                case 2: low = r.ReadUint32(); break;
+                case 3: high = r.ReadUint32(); break;
+                case 4: m.Sha256 = r.ReadBytes(); break;
+                default: r.Skip(wt); break;
+            }
+        }
+        m.FileSize = ((ulong)high << 32) | low;
+        return m;
+    }
+}
+
+/// <summary>独立文件共享 64KB 分块数据</summary>
+public sealed class FileShareChunk
+{
+    public string FileName = "";
+    public ulong Offset;
+    public bool IsLast;
+    public byte[] Data = Array.Empty<byte>();
+
+    public byte[] Encode()
+    {
+        var o = new List<byte>();
+        Proto.WriteString(o, 1, FileName);
+        Proto.WriteUint(o, 2, (uint)(Offset & 0xFFFFFFFF));
+        Proto.WriteUint(o, 3, (uint)(Offset >> 32));
+        Proto.WriteBool(o, 4, IsLast);
+        Proto.WriteBytes(o, 5, Data);
+        return o.ToArray();
+    }
+
+    public static FileShareChunk Decode(byte[] payload)
+    {
+        var r = new Proto.Reader(payload);
+        var m = new FileShareChunk();
+        uint low = 0, high = 0;
+        while (r.ReadTag(out var f, out var wt))
+        {
+            switch (f)
+            {
+                case 1: m.FileName = r.ReadString(); break;
+                case 2: low = r.ReadUint32(); break;
+                case 3: high = r.ReadUint32(); break;
+                case 4: m.IsLast = r.ReadBool(); break;
+                case 5: m.Data = r.ReadBytes(); break;
+                default: r.Skip(wt); break;
+            }
+        }
+        m.Offset = ((ulong)high << 32) | low;
+        return m;
+    }
+}

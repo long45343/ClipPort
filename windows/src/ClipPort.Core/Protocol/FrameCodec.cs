@@ -19,6 +19,8 @@ public static class FrameCodec
     public const byte Cancel = 0x18;
     public const byte Ping = 0x20;
     public const byte Pong = 0x21;
+    public const byte FileShareMeta = 0x40;
+    public const byte FileShareChunk = 0x41;
 
     public const int MaxPayload = 64 * 1024 * 1024;
 

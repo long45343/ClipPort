@@ -34,10 +34,30 @@ object ClipFilter {
 /** mime 判定工具。 */
 object MimeUtil {
     fun isHtml(desc: ClipDescription): Boolean = desc.hasMimeType("text/html")
+    fun isImage(desc: ClipDescription): Boolean =
+        desc.hasMimeType("image/png") || desc.hasMimeType("image/jpeg") || desc.hasMimeType("image/*")
+
     fun textOf(cm: ClipboardManager): String? {
         val clip = cm.primaryClip ?: return null
         if (clip.itemCount == 0) return null
         return clip.getItemAt(0).coerceToText(null)?.toString()?.ifEmpty { null }
+    }
+
+    /** 从剪贴板提取图片为 PNG 字节流（支持直接 URI 或 Intent 附件） */
+    fun imagePngOf(ctx: Context, cm: ClipboardManager): ByteArray? {
+        val clip = cm.primaryClip ?: return null
+        if (clip.itemCount == 0) return null
+        val uri = clip.getItemAt(0).uri ?: return null
+        val mime = ctx.contentResolver.getType(uri) ?: (if (clip.description.mimeTypeCount > 0) clip.description.getMimeType(0) else "")
+        if (!mime.startsWith("image/")) return null
+        return try {
+            ctx.contentResolver.openInputStream(uri)?.use { stream ->
+                val bmp = android.graphics.BitmapFactory.decodeStream(stream) ?: return null
+                val out = java.io.ByteArrayOutputStream()
+                bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                out.toByteArray()
+            }
+        } catch (_: Exception) { null }
     }
 }
 
@@ -49,7 +69,8 @@ data class ClipPayload(
 )
 
 /** 远端内容写入器（spec §5.1）：带 SELF_LABEL 写入 + 可配置自动清除（D-15）。
- *  直接写入被系统拒绝（后台无焦点/非 IME）时，拉起悬浮获焦 Activity 写入兜底。 */
+ *  直接写入被系统拒绝（后台无焦点/非 IME）时，拉起悬浮获焦 Activity 写入兜底。
+ *  D-28=A: 图片通过私有 FileProvider 以 content:// 暴露，不污染相册。 */
 class RemoteClipApplier(
     private val cm: ClipboardManager,
     private val clearMs: Long = ClipConst.REMOTE_CLEAR_MS,
@@ -65,6 +86,26 @@ class RemoteClipApplier(
             mimes.add(if (!html.isNullOrEmpty()) "text/html" else "text/plain")
             items.add(ClipData.Item(text ?: "", html))
         }
+
+        // 写入远端截图（D-28=A）
+        if (imagePng != null && imagePng.isNotEmpty()) {
+            val ctx = context
+            if (ctx != null) {
+                try {
+                    val dir = java.io.File(ctx.cacheDir, "clip_images").apply { mkdirs() }
+                    val file = java.io.File(dir, "remote_clip.png")
+                    file.writeBytes(imagePng)
+                    val uri = androidx.core.content.FileProvider.getUriForFile(
+                        ctx, "com.clipport.app.fileprovider", file
+                    )
+                    mimes.add("image/png")
+                    items.add(ClipData.Item(uri))
+                } catch (e: Exception) {
+                    android.util.Log.w("RemoteClipApplier", "save remote image failed", e)
+                }
+            }
+        }
+
         if (items.isEmpty()) return
         val desc = ClipDescription(ClipConst.SELF_LABEL, mimes.toTypedArray())
         val clip = ClipData(desc, items[0])

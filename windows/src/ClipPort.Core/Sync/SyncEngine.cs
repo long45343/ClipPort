@@ -28,6 +28,7 @@ public sealed class SyncEngine : IDisposable
     private DateTime _lastRemoteAt = DateTime.MinValue;
     private readonly ScreenGate _screenGate = new();
     public Net.PeerStore Peers { get; } = Net.PeerStore.Load();
+    public FileShareManager FileShare { get; }
     /// <summary>本端证书指纹提供者（SHA256(DER)，App 注入）。</summary>
     public Func<byte[]?>? OwnFpProvider { get; set; }
     private Net.UdpDiscovery? _udp;
@@ -41,12 +42,14 @@ public sealed class SyncEngine : IDisposable
     {
         _cfg = cfg;
         _server = server;
+        FileShare = new FileShareManager(msg => Log?.Invoke(msg));
         _server.OnBroadcast = OnBroadcastFrame;
         _server.OnTextRequest = OnTextRequest;
         _server.OnPairRequest = OnPairRequest;
         _server.OnHello = OnPhoneHello;
         _server.OnPairOk = OnPairOkResult;
         _server.OwnHelloProvider = OwnHello;
+        _server.OnFileShareChunk = chunk => FileShare.HandleIncomingChunk(chunk);
         StartUdpDiscovery();
         _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "clipport-sync" };
         _worker.Start();

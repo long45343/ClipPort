@@ -46,9 +46,14 @@ class ClipPortService : Service() {
 
     fun openPairing(): String? = manager?.openPairing()
 
+    fun sendFile(uri: android.net.Uri) {
+        manager?.sendFile(uri)
+    }
+
     private var manager: SyncManager? = null
     private var listener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var cm: ClipboardManager? = null
+    private var logcatWatcher: com.clipport.app.clip.LogcatClipboardWatcher? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -77,6 +82,13 @@ class ClipPortService : Service() {
         }
         listener = l
         cm?.addPrimaryClipChangedListener(l)
+
+        // 启动非 Root 降级读取守护线程（D-19=A）
+        logcatWatcher = com.clipport.app.clip.LogcatClipboardWatcher(this) { msg ->
+            statusText = msg
+            android.util.Log.i("ClipPortService", msg)
+        }
+        logcatWatcher?.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -84,6 +96,8 @@ class ClipPortService : Service() {
     }
 
     override fun onDestroy() {
+        logcatWatcher?.stop()
+        logcatWatcher = null
         listener?.let { cm?.removePrimaryClipChangedListener(it) }
         manager?.disconnect()
         running = false

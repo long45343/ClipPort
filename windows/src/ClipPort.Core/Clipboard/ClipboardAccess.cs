@@ -21,7 +21,9 @@ public sealed class ClipboardSnapshot
 public static class ClipboardAccess
 {
     public static readonly uint SelfFormat = Native.RegisterClipboardFormatW("ClipPort.Self");
+    public static readonly uint PngFormat = Native.RegisterClipboardFormatW("PNG");
     private static readonly uint HtmlFormat = Native.RegisterClipboardFormatW("HTML Format");
+    private static readonly byte[] PngMagic = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
     private static bool OpenRetry(int retries = 3)
     {
@@ -40,6 +42,18 @@ public static class ClipboardAccess
         if (!OpenRetry()) return snap;
         try
         {
+            // D-25=A：检测常规文件（CF_HDROP）。若包含文件且没有图片格式，严格静默忽略
+            bool hasDrop = Native.GetClipboardData(Native.CF_HDROP) != IntPtr.Zero;
+            bool hasImage = Native.GetClipboardData(PngFormat) != IntPtr.Zero ||
+                            Native.GetClipboardData(Native.CF_DIB) != IntPtr.Zero ||
+                            Native.GetClipboardData(Native.CF_DIBV5) != IntPtr.Zero ||
+                            Native.GetClipboardData(Native.CF_BITMAP) != IntPtr.Zero;
+            if (hasDrop && !hasImage)
+            {
+                // 用户复制的是纯文件（视频/压缩包/安装包等），直接静默忽略
+                return snap;
+            }
+
             var td = GetDataNoOpen(Native.CF_UNICODETEXT);
             if (td is { Length: >= 2 }) snap.Text = Encoding.Unicode.GetString(td).TrimEnd('\0');
             if (snap.Text is { Length: 0 }) snap.Text = null;
@@ -90,11 +104,19 @@ public static class ClipboardAccess
 
     private static byte[]? ReadImageNoOpen()
     {
-        var data = GetDataNoOpen(Native.CF_DIB);
-        if (data is null || data.Length < 40) return null;
+        // 1. 优先读取注册的 "PNG" 格式（Snipaste / 微信截图专用，完美保留 32 位 ARGB 透明度与阴影，杜绝黑底）
+        var pngData = GetDataNoOpen(PngFormat);
+        if (pngData is { Length: >= 8 } && pngData.AsSpan(0, 8).SequenceEqual(PngMagic))
+        {
+            return pngData;
+        }
+
+        // 2. 次级探测 CF_DIBV5 或 CF_DIB
+        var dibData = GetDataNoOpen(Native.CF_DIBV5) ?? GetDataNoOpen(Native.CF_DIB);
+        if (dibData is null || dibData.Length < 40) return null;
         try
         {
-            using var bmpMs = DibToBmpFile(data);
+            using var bmpMs = DibToBmpFile(dibData);
             using var bmp = new System.Drawing.Bitmap(bmpMs);
             using var outMs = new MemoryStream();
             bmp.Save(outMs, ImageFormat.Png);
@@ -132,12 +154,21 @@ public static class ClipboardAccess
             if (snap.Html is not null) SetString(HtmlFormat, BuildHtmlFormatHeader(snap.Html));
             if (snap.ImagePng is not null)
             {
-                using var bmp = new System.Drawing.Bitmap(new MemoryStream(snap.ImagePng));
-                using var ms = new MemoryStream();
-                bmp.Save(ms, ImageFormat.Bmp);
-                var dib = new byte[ms.Length - 14];
-                Array.Copy(ms.GetBuffer(), 14, dib, 0, dib.Length);
-                SetBytes(Native.CF_DIB, dib);
+                // 同时写入 "PNG" 注册格式，确保 Office 与新版微信支持 Alpha 透明通道
+                SetBytes(PngFormat, snap.ImagePng);
+                try
+                {
+                    using var bmp = new System.Drawing.Bitmap(new MemoryStream(snap.ImagePng));
+                    using var ms = new MemoryStream();
+                    bmp.Save(ms, ImageFormat.Bmp);
+                    if (ms.Length > 14)
+                    {
+                        var dib = new byte[ms.Length - 14];
+                        Array.Copy(ms.GetBuffer(), 14, dib, 0, dib.Length);
+                        SetBytes(Native.CF_DIB, dib);
+                    }
+                }
+                catch { }
             }
             SetBytes(SelfFormat, BitConverter.GetBytes(selfSeq));
             return true;

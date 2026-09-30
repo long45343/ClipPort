@@ -50,6 +50,28 @@ class SyncManager(
 
     @Volatile private var localPending = false
 
+    init {
+        com.clipport.app.xposed.FloatingClipboardBridge.register { text, html ->
+            onFloatingClipRead(text, html)
+        }
+    }
+
+    private fun onFloatingClipRead(text: String?, html: String?) {
+        handler.post {
+            try {
+                if (!prefs.syncEnabled) return@post
+                if (text.isNullOrEmpty() && html.isNullOrEmpty()) return@post
+                if (text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return@post
+                if (text == lastLocalPayload?.text && System.currentTimeMillis() - lastLocalAt < 1000) return@post
+                val payload = ClipPayload(text, html, null)
+                publish(payload)
+                status("已通过悬浮降级通道读取并同步剪贴板")
+            } catch (e: Exception) {
+                Log.w(TAG, "floating clip handling error", e)
+            }
+        }
+    }
+
     /** 本地剪贴板变化（Service/Watcher 回调，任意线程）；100ms 防抖合并（spec §1.3）。 */
     fun onLocalClipChanged() {
         if (localPending) return
@@ -63,16 +85,31 @@ class SyncManager(
     private fun handleLocalClip() {
         try {
             if (!prefs.syncEnabled) return
-            if (ClipFilter.isSelfLabeled(cm.primaryClip?.description)) return          // 防回环第1道
+            val primary = cm.primaryClip ?: return
+            if (ClipFilter.isSelfLabeled(primary.description)) return // 防回环第1道
+
+            // D-25=A: 过滤常规纯文件。若仅含非图片 URI，严格静默忽略
+            if (primary.itemCount > 0 && primary.getItemAt(0).uri != null) {
+                val uri = primary.getItemAt(0).uri
+                val mime = context.contentResolver.getType(uri)
+                    ?: (if (primary.description.mimeTypeCount > 0) primary.description.getMimeType(0) else "")
+                if (!mime.startsWith("image/")) {
+                    return // 纯文件，静默忽略
+                }
+            }
+
             val text = MimeUtil.textOf(cm)
-            if (text == null) {
+            val htmlText = if (primary.itemCount > 0) primary.getItemAt(0).htmlText?.toString() else null
+            val imagePng = MimeUtil.imagePngOf(context, cm)
+
+            if (text == null && htmlText == null && imagePng == null) {
                 // 监听回调到了但读不到数据 = 后台读取被系统限制（无 hook/无焦点）
                 status("剪贴板读取受限——需启用 LSPosed 模块（系统作用域）并重启，或等待悬浮窗读取模式")
                 return
             }
-            if (text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return // 防回声
-            val htmlText = cm.primaryClip?.let { if (it.itemCount > 0) it.getItemAt(0).htmlText?.toString() else null }
-            val payload = ClipPayload(text, htmlText, null)
+            if (text != null && text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return // 防回声
+
+            val payload = ClipPayload(text, htmlText, imagePng)
             publish(payload)
         } catch (e: Exception) {
             Log.w(TAG, "local clip error", e)
@@ -325,9 +362,11 @@ class SyncManager(
         handler.post {
             try {
                 val self = selfHello()
+                val isPairing = pairingMode || !pinned || prefs.serverFpHex == null
                 val l = PcLink.client(
                     host, prefs.port,
                     pinnedFp = prefs.serverFpHex?.hexToBytes(),
+                    trustAny = isPairing,
                     self = self,
                     ownFp = PeerIdentity.fingerprint(context),
                     listener = this,
@@ -364,9 +403,11 @@ class SyncManager(
     }
 
     fun disconnect() {
+        com.clipport.app.xposed.FloatingClipboardBridge.unregister()
         links.forEach { it.close() }
         links.clear()
         peerServer?.stop()
+        peerServer = null
         LanDiscovery.stop()
         udpDiscoveryStarted = false
     }
@@ -432,6 +473,86 @@ class SyncManager(
         peerServer = PeerServer(context, selfHello(), PeerIdentity.fingerprint(context), this) { s -> status(s) }
             .also { it.start() }
         startUdpDiscovery()
+    }
+
+    // ---- 独立文件共享通道（D-26=A，与剪贴板解耦）----
+    private val incomingFileStreams = java.util.concurrent.ConcurrentHashMap<String, java.io.FileOutputStream>()
+
+    override fun onFileShareChunk(chunk: FileShareChunk) {
+        handler.post {
+            try {
+                val dir = java.io.File(
+                    android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
+                    "ClipPort"
+                ).apply { mkdirs() }
+                val targetFile = java.io.File(dir, chunk.fileName)
+                var fos = incomingFileStreams[chunk.fileName]
+                if (fos == null) {
+                    fos = java.io.FileOutputStream(targetFile)
+                    incomingFileStreams[chunk.fileName] = fos
+                    status("正在接收共享文件：${chunk.fileName}…")
+                }
+                fos.write(chunk.data)
+                if (chunk.isLast) {
+                    fos.flush()
+                    fos.close()
+                    incomingFileStreams.remove(chunk.fileName)
+                    status("文件接收完毕！已保存至 Download/ClipPort/${chunk.fileName}")
+                    android.media.MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), null, null)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "write file chunk error", e)
+                incomingFileStreams.remove(chunk.fileName)?.runCatching { close() }
+            }
+        }
+    }
+
+    /** 发送本地文件至在线设备 */
+    fun sendFile(uri: android.net.Uri) {
+        val targets = links.filter { it.alive && it.paired }
+        if (targets.isEmpty()) {
+            status("无可用的已配对连接，无法发送文件")
+            return
+        }
+        kotlin.concurrent.thread(name = "clipport-file-send") {
+            try {
+                var fileName = "shared_file"
+                var fileSize = 0L
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    if (cursor.moveToFirst()) {
+                        if (nameIdx >= 0) fileName = cursor.getString(nameIdx) ?: fileName
+                        if (sizeIdx >= 0) fileSize = cursor.getLong(sizeIdx)
+                    }
+                }
+                status("开始发送文件：$fileName…")
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    val buffer = ByteArray(64 * 1024)
+                    var offset = 0L
+                    var read: Int
+                    while (stream.read(buffer).also { read = it } > 0) {
+                        offset += read
+                        val isLast = if (fileSize > 0) offset >= fileSize else stream.available() == 0
+                        val data = if (read == buffer.size) buffer else buffer.copyOf(read)
+                        val chunk = FileShareChunk().apply {
+                            this.fileName = fileName
+                            this.offset = offset
+                            this.isLast = isLast
+                            this.data = data
+                        }
+                        for (l in targets) {
+                            l.send(FrameCodec.FILE_SHARE_CHUNK, 0, chunk.encode())
+                        }
+                        if (isLast) break
+                    }
+                }
+                status("文件已发送完毕：$fileName")
+            } catch (e: Exception) {
+                Log.w(TAG, "send file failed", e)
+                status("发送文件失败: ${e.message}")
+            }
+        }
     }
 }
 

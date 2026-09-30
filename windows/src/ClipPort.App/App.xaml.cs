@@ -120,6 +120,14 @@ public partial class App : Application
         OnEngineLog($"配对窗口已开启，code={code}");
     }
 
+    public string BuildPairingUri(string code)
+    {
+        var ip = BlePublisher.AllLanIpv4().FirstOrDefault()?.ToString() ?? "127.0.0.1";
+        var fp = _ownCert is null ? "" : Convert.ToHexString(CertManager.Fingerprint(_ownCert)).ToLowerInvariant();
+        var name = Uri.EscapeDataString(Config.DeviceName);
+        return $"clipport://pair?host={ip}&port={Config.TcpPort}&code={code}&fp={fp}&name={name}";
+    }
+
     public void ShutdownApp()
     {
         _listener?.Dispose();

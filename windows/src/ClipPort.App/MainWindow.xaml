@@ -44,6 +44,7 @@
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
@@ -61,17 +62,31 @@
                         </StackPanel>
                         <ui:TextBlock x:Name="LocalIpText" Text="本机地址: 获取中…" Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
-                    <ui:ToggleSwitch x:Name="SyncToggle" Grid.Column="1" Content="同步" IsChecked="True" Click="SyncToggle_Click" />
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <ui:ToggleSwitch x:Name="AutoStartToggle" Content="开机自启" Margin="0,0,16,0" Click="AutoStartToggle_Click" />
+                        <ui:ToggleSwitch x:Name="SyncToggle" Content="同步" IsChecked="True" Click="SyncToggle_Click" />
+                    </StackPanel>
                 </Grid>
             </ui:Card>
 
             <!-- Pairing Card -->
             <ui:Card Grid.Row="1" Margin="0,0,0,12" Padding="16">
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <ui:Button x:Name="PairBtn" Content="开始配对" Appearance="Primary" Click="PairBtn_Click" Margin="0,0,16,0" />
-                    <ui:TextBlock x:Name="PairCodeText" Text="" FontTypography="TitleLarge" FontWeight="Bold" Margin="0,0,16,0" />
-                    <ui:TextBlock Text="（点击后在其他设备输入该配对码）" VerticalAlignment="Center" Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}" />
-                </StackPanel>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,8">
+                            <ui:Button x:Name="PairBtn" Content="开始配对" Appearance="Primary" Click="PairBtn_Click" Margin="0,0,16,0" />
+                            <ui:TextBlock x:Name="PairCodeText" Text="" FontTypography="TitleLarge" FontWeight="Bold" Margin="0,0,16,0" />
+                        </StackPanel>
+                        <ui:TextBlock x:Name="PairHintText" Text="点击「开始配对」生成 6 位配对码及手机扫码互联二维码" Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Border x:Name="QrBorder" Grid.Column="1" Visibility="Collapsed" Background="White" CornerRadius="8" Padding="6" Margin="16,0,0,0">
+                        <Image x:Name="QrImage" Width="108" Height="108" RenderOptions.BitmapScalingMode="NearestNeighbor" />
+                    </Border>
+                </Grid>
             </ui:Card>
 
             <!-- Connect Other Devices Section -->
@@ -87,11 +102,26 @@
                 </StackPanel>
             </ui:Card>
 
+            <!-- File Share Card (D-26=A) -->
+            <ui:Card Grid.Row="3" Margin="0,0,0,12" Padding="14" AllowDrop="True" Drop="FileDrop_Drop" DragOver="FileDrop_DragOver">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                        <ui:TextBlock Text="文件共享（拖拽文件至此直接推发给在线设备）" FontWeight="SemiBold" />
+                        <ui:TextBlock Text="接收文件自动保存至系统「下载/ClipPort」目录" Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}" FontSize="12" Margin="0,2,0,0" />
+                    </StackPanel>
+                    <ui:Button Grid.Column="1" Content="选择文件发送…" Appearance="Secondary" Click="SendFileBtn_Click" />
+                </Grid>
+            </ui:Card>
+
             <!-- Log Header -->
-            <ui:TextBlock Grid.Row="3" Text="运行日志" FontWeight="SemiBold" Margin="0,0,0,6" />
+            <ui:TextBlock Grid.Row="4" Text="运行日志" FontWeight="SemiBold" Margin="0,0,0,6" />
 
             <!-- Log ListView -->
-            <ui:ListView x:Name="LogList" Grid.Row="4" SelectionMode="Single" />
+            <ui:ListView x:Name="LogList" Grid.Row="5" SelectionMode="Single" />
         </Grid>
     </Grid>
 </ui:FluentWindow>

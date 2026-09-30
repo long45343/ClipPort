@@ -15,6 +15,8 @@ object FrameCodec {
     const val CANCEL: Byte = 0x18
     const val PING: Byte = 0x20
     const val PONG: Byte = 0x21
+    const val FILE_SHARE_META: Byte = 0x40
+    const val FILE_SHARE_CHUNK: Byte = 0x41
 
     const val MAX_PAYLOAD = 64 * 1024 * 1024
 
@@ -316,6 +318,79 @@ class TextResponse {
                     else -> r.skip(wt)
                 }
             }
+            return m
+        }
+    }
+}
+
+class FileShareMeta {
+    var fileName: String = ""
+    var fileSize: Long = 0
+    var sha256: ByteArray = ByteArray(0)
+
+    fun encode(): ByteArray {
+        val o = ArrayList<Byte>()
+        Proto.string(o, 1, fileName)
+        Proto.uint(o, 2, fileSize and 0xFFFFFFFF)
+        Proto.uint(o, 3, fileSize ushr 32)
+        Proto.bytes(o, 4, sha256)
+        return o.toByteArray()
+    }
+
+    companion object {
+        fun decode(p: ByteArray): FileShareMeta {
+            val r = Proto.Reader(p)
+            val m = FileShareMeta()
+            var low = 0L; var high = 0L
+            while (true) {
+                val (f, wt) = r.readTag() ?: break
+                when (f) {
+                    1 -> m.fileName = r.string()
+                    2 -> low = r.uint32()
+                    3 -> high = r.uint32()
+                    4 -> m.sha256 = r.bytes()
+                    else -> r.skip(wt)
+                }
+            }
+            m.fileSize = (high shl 32) or low
+            return m
+        }
+    }
+}
+
+class FileShareChunk {
+    var fileName: String = ""
+    var offset: Long = 0
+    var isLast: Boolean = false
+    var data: ByteArray = ByteArray(0)
+
+    fun encode(): ByteArray {
+        val o = ArrayList<Byte>()
+        Proto.string(o, 1, fileName)
+        Proto.uint(o, 2, offset and 0xFFFFFFFF)
+        Proto.uint(o, 3, offset ushr 32)
+        Proto.bool(o, 4, isLast)
+        Proto.bytes(o, 5, data)
+        return o.toByteArray()
+    }
+
+    companion object {
+        fun decode(p: ByteArray): FileShareChunk {
+            val r = Proto.Reader(p)
+            val m = FileShareChunk()
+            var low = 0L; var high = 0L
+            while (true) {
+                val (f, wt) = r.readTag() ?: break
+                when (f) {
+                    1 -> m.fileName = r.string()
+                    2 -> low = r.uint32()
+                    3 -> high = r.uint32()
+                    4 -> m.isLast = r.bool()
+                    5 -> m.data = r.bytes()
+                    else -> r.skip(wt)
+                }
+            }
+            m.offset = (high shl 32) or low
             return m
         }
     }

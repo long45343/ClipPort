@@ -11,15 +11,20 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -30,10 +35,22 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.clipport.app.service.ClipPortService
 import com.clipport.app.transport.PeerBook
 import com.clipport.app.transport.PeerEntry
+import com.clipport.app.ui.ScanPairActivity
+import com.clipport.app.util.AppDetailsUtil
+import com.clipport.app.util.BatteryOptimizationHelper
+
+data class PairTarget(
+    val host: String,
+    val port: String,
+    val code: String,
+    val fp: String,
+    val name: String
+)
 
 /** 主界面（D-12：Compose Material 3 设置页，兼作 Xposed 配置宿主）。
  *  权限门控启动：先申请运行时权限，全部落定后才启动前台服务（connectedDevice 类型
@@ -50,6 +67,32 @@ class MainActivity : ComponentActivity() {
     private var status by mutableStateOf("初始化…")
     private var paired by mutableStateOf(false)
     private var peers by mutableStateOf(listOf<PeerEntry>())
+    private var batteryOptimized by mutableStateOf(true)
+    private var showPairConfirmDialog by mutableStateOf(false)
+    private var pendingPairTarget by mutableStateOf<PairTarget?>(null)
+
+    private val scanLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            val h = result.data?.getStringExtra(ScanPairActivity.EXTRA_HOST) ?: ""
+            val p = result.data?.getStringExtra(ScanPairActivity.EXTRA_PORT) ?: "47190"
+            val c = result.data?.getStringExtra(ScanPairActivity.EXTRA_CODE) ?: ""
+            val f = result.data?.getStringExtra(ScanPairActivity.EXTRA_FP) ?: ""
+            val n = result.data?.getStringExtra(ScanPairActivity.EXTRA_NAME) ?: ""
+            if (h.isNotBlank() && c.length == 6) {
+                pendingPairTarget = PairTarget(h, p, c, f, n)
+                showPairConfirmDialog = true
+            }
+        }
+    }
+
+    private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        if (!uris.isNullOrEmpty()) {
+            startServiceSafely()
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                for (u in uris) ClipPortService.instance?.sendFile(u)
+            }, 500)
+        }
+    }
 
     /// 权限落定后要执行的续作：null=仅启动服务；"pair"=配对；"discover"=自动发现
     private var pendingAction: String? = null
@@ -77,6 +120,8 @@ class MainActivity : ComponentActivity() {
         status = if (ClipPortService.running) ClipPortService.statusText else "申请权限中…"
 
         requestEssentialPermissions(then = null)
+        batteryOptimized = BatteryOptimizationHelper.isIgnoringBatteryOptimizations(this)
+        handleSendIntent(intent)
         setContent { MaterialTheme { Screen() } }
         // 服务状态实时回显（服务在后台持续更新 ClipPortService.statusText）
         val poll = object : Runnable {
@@ -89,6 +134,47 @@ class MainActivity : ComponentActivity() {
             }
         }
         android.os.Handler(android.os.Looper.getMainLooper()).post(poll)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleSendIntent(intent)
+    }
+
+    private fun handleSendIntent(intent: Intent?) {
+        if (intent == null) return
+        if (intent.action == Intent.ACTION_SEND) {
+            val uri = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, android.net.Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
+            if (uri != null) {
+                startServiceSafely()
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    ClipPortService.instance?.sendFile(uri)
+                }, 1000)
+            }
+        } else if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
+            val uris = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, android.net.Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+            }
+            if (!uris.isNullOrEmpty()) {
+                startServiceSafely()
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    for (u in uris) ClipPortService.instance?.sendFile(u)
+                }, 1000)
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        batteryOptimized = BatteryOptimizationHelper.isIgnoringBatteryOptimizations(this)
     }
 
     /** 申请关键运行时权限；全部已持有时直接执行续作。 */
@@ -140,6 +226,41 @@ class MainActivity : ComponentActivity() {
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                if (!batteryOptimized) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f),
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer
+                        ),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                    ) {
+                        Column(Modifier.padding(14.dp)) {
+                            Text(
+                                "⚠️ 灭屏常驻保活受限",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "请将 ClipPort 加入「忽略电池优化」白名单并允许后台自启动，否则手机锁屏灭屏后网络连接将被系统冻结而导致断连。",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = {
+                                    BatteryOptimizationHelper.requestIgnoreBatteryOptimizations(this@MainActivity)
+                                }) {
+                                    Text("忽略电池优化")
+                                }
+                                OutlinedButton(onClick = {
+                                    AppDetailsUtil.openAppDetails(this@MainActivity)
+                                }) {
+                                    Text("应用自启管理")
+                                }
+                            }
+                        }
+                    }
+                }
                 OutlinedTextField(
                     value = host, onValueChange = { host = it },
                     label = { Text("PC 地址（自动发现时免填）") }, modifier = Modifier.fillMaxWidth(),
@@ -155,7 +276,15 @@ class MainActivity : ComponentActivity() {
                         label = { Text("配对码") }, modifier = Modifier.weight(1f), singleLine = true,
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Button(onClick = {
+                        scanLauncher.launch(Intent(this@MainActivity, ScanPairActivity::class.java))
+                    }) {
+                        Text("📷 扫码")
+                    }
                     Button(onClick = {
                         prefs.pairingCode = code
                         prefs.serverFpHex = null
@@ -238,6 +367,24 @@ class MainActivity : ComponentActivity() {
                     status = "已保存清除策略"
                 }) { Text("保存清除策略") }
                 HorizontalDivider()
+                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("独立文件共享", style = MaterialTheme.typography.titleSmall)
+                            Text("选文件推发给已配对设备，接收自动存入 Download/ClipPort", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Button(onClick = {
+                            filePickerLauncher.launch("*/*")
+                        }) {
+                            Text("发送文件")
+                        }
+                    }
+                }
+                HorizontalDivider()
                 Button(onClick = {
                     if (android.provider.Settings.canDrawOverlays(this@MainActivity)) {
                         status = "悬浮窗权限已授予"
@@ -259,6 +406,53 @@ class MainActivity : ComponentActivity() {
                         "在 LSPosed 管理器中启用并勾选「系统作用域」后重启，即可后台读剪贴板；" +
                         "未 root 设备可用 ADB/Shizuku 授予 READ_LOGS 走降级通道。",
                     style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            if (showPairConfirmDialog && pendingPairTarget != null) {
+                val target = pendingPairTarget!!
+                AlertDialog(
+                    onDismissRequest = { showPairConfirmDialog = false },
+                    title = { Text("确认信任并配对设备？") },
+                    text = {
+                        Column {
+                            Text("设备名称: ${target.name.ifEmpty { "局域网 PC" }}", fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text("连接端点: ${target.host}:${target.port}")
+                            Spacer(Modifier.height(4.dp))
+                            Text("临时配对码: ${target.code}")
+                            if (target.fp.isNotBlank()) {
+                                Spacer(Modifier.height(4.dp))
+                                Text("证书指纹: ${target.fp.take(16)}…", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            showPairConfirmDialog = false
+                            host = target.host
+                            port = target.port
+                            code = target.code
+                            prefs.host = target.host
+                            prefs.port = target.port.toIntOrNull() ?: 47190
+                            prefs.pairingCode = target.code
+                            prefs.serverFpHex = null
+                            paired = false
+                            ClipPortService.statusText = "配对中…"
+                            status = "配对中…"
+                            startServiceSafely()
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                ClipPortService.instance?.requestPair()
+                            }, 500)
+                        }) {
+                            Text("确认配对")
+                        }
+                    },
+                    dismissButton = {
+                        OutlinedButton(onClick = { showPairConfirmDialog = false }) {
+                            Text("取消")
+                        }
+                    }
                 )
             }
         }

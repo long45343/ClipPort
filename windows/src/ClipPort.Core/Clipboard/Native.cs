@@ -5,8 +5,11 @@ namespace ClipPort.Core.Clipboard;
 internal static class Native
 {
     public const uint WM_CLIPBOARDUPDATE = 0x031D;
-    public const uint CF_UNICODETEXT = 13;
+    public const uint CF_BITMAP = 2;
     public const uint CF_DIB = 8;
+    public const uint CF_UNICODETEXT = 13;
+    public const uint CF_HDROP = 15;
+    public const uint CF_DIBV5 = 17;
     public const uint GMEM_MOVEABLE = 0x0002;
 
     [DllImport("user32.dll", SetLastError = true)]
