@@ -13,6 +13,7 @@ import com.clipport.app.protocol.*
 import com.clipport.app.transport.PeerBook
 import com.clipport.app.transport.PeerIdentity
 import com.clipport.app.transport.PeerServer
+import com.clipport.app.transport.LanDiscovery
 import com.clipport.app.transport.PcDiscovery
 import com.clipport.app.transport.PcLink
 import java.security.MessageDigest
@@ -214,6 +215,7 @@ class SyncManager(
                 link.remoteName,
                 joinerFp?.joinToString("") { b -> "%02x".format(b) } ?: fpHex,
                 link.remoteEndpoint,
+                markPaired = true,
             )
             status("配对成功（本端作为服务端）")
             true
@@ -233,6 +235,7 @@ class SyncManager(
                 link.remoteName.ifEmpty { "peer" },
                 fpHex,
                 link.remoteEndpoint,
+                markPaired = true,
             )
             pairingMode = false
             status("配对成功，指纹已固定")
@@ -364,6 +367,8 @@ class SyncManager(
         links.forEach { it.close() }
         links.clear()
         peerServer?.stop()
+        LanDiscovery.stop()
+        udpDiscoveryStarted = false
     }
 
     /** 开启配对窗口（本端作为服务端被连方）。返回 6 位码。 */
@@ -375,11 +380,58 @@ class SyncManager(
         return code
     }
 
+    private var udpDiscoveryStarted = false
+    private val connectAttempts = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** M8: UDP 广播发现——通告自己 + 监听对端；已配对对端出现时自动建链。 */
+    private fun startUdpDiscovery() {
+        if (udpDiscoveryStarted) return
+        udpDiscoveryStarted = true
+        val fpHex = PeerIdentity.fingerprint(context).joinToString("") { b -> "%02x".format(b) }
+        val id = prefs.deviceIdBytes().joinToString("") { b -> "%02x".format(b) }
+        LanDiscovery.start(
+            context = context,
+            id = id,
+            name = android.os.Build.MODEL,
+            type = 1,
+            port = PeerServer.DEFAULT_PORT,
+            fpHex = fpHex.take(16),
+            announced = { dId, name, type, port, fp, ip ->
+                handler.post { handleAnnounced(dId, name, type, port, fp, ip) }
+            },
+            statusCb = { s -> status(s) }
+        )
+    }
+
+    private fun handleAnnounced(dId: String, name: String, type: Int, port: Int, fp: String, ip: String) {
+        try {
+            val peer = peerBook.upsert(dId, name, fp.take(16).ifEmpty { null }, "$ip:$port")
+            if (peer.paired) {
+                // 已配对：自动建链。仲裁：仅 deviceId 较小的一方连出（防双向重复建链）
+                val myId = prefs.deviceIdBytes().joinToString("") { b -> "%02x".format(b) }
+                if (myId > dId) return
+                if (links.any { it.alive && it.peerHelloDeviceId == dId }) return
+                val last = connectAttempts[dId]
+                if (last != null && System.currentTimeMillis() - last < 15_000) return
+                connectAttempts[dId] = System.currentTimeMillis()
+                status("自动连接已配对设备 $name ($ip:$port)")
+                prefs.host = ip
+                prefs.port = port
+                connect(pinned = true)
+            } else {
+                status("发现未配对设备 $name ($ip:$port)——开启对端配对窗口后输码连接")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "announce error", e)
+        }
+    }
+
     /** 二期: 启动对等服务端（每台设备皆可被连）。 */
     fun startServerRole() {
         if (peerServer?.running == true) return
         peerServer = PeerServer(context, selfHello(), PeerIdentity.fingerprint(context), this) { s -> status(s) }
             .also { it.start() }
+        startUdpDiscovery()
     }
 }
 

@@ -54,9 +54,11 @@ public partial class App : Application
 
         UiQueue = DispatcherQueue.GetForCurrentThread();
         Config = AppConfig.Load();
+        _ownCert = CertManager.GetOrCreate();
 
         Server = new TlsLinkServer();
         Engine = new SyncEngine(Config, Server) { Log = OnEngineLog, StatusChanged = OnStatus };
+        Engine.OwnFpProvider = () => System.Security.Cryptography.SHA256.HashData(_ownCert.RawData);
         Server.Log = OnEngineLog;
         Server.OwnHelloProvider = () => new Core.Protocol.Hello
         {

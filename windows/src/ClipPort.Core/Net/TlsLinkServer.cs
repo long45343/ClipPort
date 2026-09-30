@@ -129,6 +129,14 @@ public sealed class TlsLinkServer : IAsyncDisposable
         }
     }
 
+    /// <summary>是否已存在到该设备的存活链接（自动建链去重用）。</summary>
+    public bool HasAliveLinkTo(string deviceIdHex)
+    {
+        lock (_gate)
+            return _links.Any(l => l.Alive &&
+                Convert.ToHexString(l.PeerHello.DeviceId).Equals(deviceIdHex, StringComparison.OrdinalIgnoreCase));
+    }
+
     public int SendToAll(byte[] frame)
     {
         lock (_gate)

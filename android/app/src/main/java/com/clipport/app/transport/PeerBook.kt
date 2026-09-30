@@ -9,6 +9,7 @@ data class PeerEntry(
     var certFpHex: String? = null,
     var endpoint: String? = null,
     var lastSeen: Long = 0,
+    var paired: Boolean = false,
 )
 
 /** 对端库（SharedPreferences JSON 持久化）。 */
@@ -27,17 +28,19 @@ class PeerBook(context: Context) {
                     o.optString("certFpHex").ifEmpty { null },
                     o.optString("endpoint").ifEmpty { null },
                     o.optLong("lastSeen"),
+                    o.optBoolean("paired"),
                 )
             }
         }
     }
 
     @Synchronized
-    fun upsert(deviceId: String, name: String?, certFpHex: String?, endpoint: String?): PeerEntry {
+    fun upsert(deviceId: String, name: String?, certFpHex: String?, endpoint: String?, markPaired: Boolean = false): PeerEntry {
         val e = items.getOrPut(deviceId) { PeerEntry(deviceId) }
         if (!name.isNullOrEmpty()) e.name = name
         if (!certFpHex.isNullOrEmpty()) e.certFpHex = certFpHex
         if (!endpoint.isNullOrEmpty()) e.endpoint = endpoint
+        if (markPaired) e.paired = true
         e.lastSeen = System.currentTimeMillis()
         persist()
         return e
@@ -67,6 +70,7 @@ class PeerBook(context: Context) {
                     .put("certFpHex", e.certFpHex ?: "")
                     .put("endpoint", e.endpoint ?: "")
                     .put("lastSeen", e.lastSeen)
+                    .put("paired", e.paired)
             )
         }
         sp.edit().putString("peers", arr.toString()).apply()

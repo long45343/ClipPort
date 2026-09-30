@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -31,12 +32,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.clipport.app.service.ClipPortService
+import com.clipport.app.transport.PeerBook
+import com.clipport.app.transport.PeerEntry
 
 /** 主界面（D-12：Compose Material 3 设置页，兼作 Xposed 配置宿主）。
  *  权限门控启动：先申请运行时权限，全部落定后才启动前台服务（connectedDevice 类型
  *  在 Android 12+ 要求已持有 BLUETOOTH_CONNECT，先斩后奏会 SecurityException 闪退）。 */
 class MainActivity : ComponentActivity() {
     private val prefs by lazy { Prefs(this) }
+    private val peerBook by lazy { PeerBook(this) }
 
     private var host by mutableStateOf("")
     private var port by mutableStateOf("47190")
@@ -45,6 +49,7 @@ class MainActivity : ComponentActivity() {
     private var syncEnabled by mutableStateOf(true)
     private var status by mutableStateOf("初始化…")
     private var paired by mutableStateOf(false)
+    private var peers by mutableStateOf(listOf<PeerEntry>())
 
     /// 权限落定后要执行的续作：null=仅启动服务；"pair"=配对；"discover"=自动发现
     private var pendingAction: String? = null
@@ -79,6 +84,7 @@ class MainActivity : ComponentActivity() {
                 // 无条件镜像服务状态：服务是状态唯一事实源，任何过滤都会造成界面冻结
                 if (ClipPortService.statusText.isNotBlank() && status != ClipPortService.statusText)
                     status = ClipPortService.statusText
+                peers = peerBook.all()
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this, 1000)
             }
         }
@@ -169,16 +175,51 @@ class MainActivity : ComponentActivity() {
                         Text("连接")
                     }
                     Button(onClick = {
-                        prefs.host = ""
-                        requestEssentialPermissions(then = "discover")
+                        val c = ClipPortService.instance?.openPairing()
+                        status = if (c != null) "本机配对码: $c（请在其他设备填入并连接本机）" else "服务未运行"
                     }) {
-                        Text("自动发现")
+                        Text("开启配对")
                     }
                 }
                 Text(
-                    "同一 WiFi 下点「自动发现」免填 IP（BLE 广播发现）；跨网段时手动填 PC 主界面显示的本机地址。配对码在 PC 端「开始配对」处生成。",
+                    "UDP 广播每 10 秒自动发现同一局域网设备；也可手动填地址。如需让其他设备连入本机，请点击「开启配对」。",
                     style = MaterialTheme.typography.bodySmall,
                 )
+                HorizontalDivider()
+                Text("发现的设备与对端（UDP 自动发现）", style = MaterialTheme.typography.titleMedium)
+                if (peers.isEmpty()) {
+                    Text(
+                        "暂未发现设备。请确保所有设备连接在同一 WiFi/局域网内，UDP 广播每 10 秒自动通告。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else {
+                    for (p in peers) {
+                        Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(p.name.ifEmpty { "未知设备" }, style = MaterialTheme.typography.titleSmall)
+                                    Text(
+                                        "${p.endpoint ?: "无端点"} ｜ ${if (p.paired) "已配对" else "未配对"}",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                if (p.endpoint != null) {
+                                    Button(onClick = {
+                                        val ep = p.endpoint!!.split(':')
+                                        host = ep[0]
+                                        if (ep.size > 1) port = ep[1]
+                                    }) {
+                                        Text("填入")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 HorizontalDivider()
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                     Text("剪贴板同步")

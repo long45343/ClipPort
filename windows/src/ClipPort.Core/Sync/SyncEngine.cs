@@ -30,6 +30,8 @@ public sealed class SyncEngine : IDisposable
     public Net.PeerStore Peers { get; } = Net.PeerStore.Load();
     /// <summary>本端证书指纹提供者（SHA256(DER)，App 注入）。</summary>
     public Func<byte[]?>? OwnFpProvider { get; set; }
+    private Net.UdpDiscovery? _udp;
+    private readonly Dictionary<string, DateTime> _connectAttempts = new();   // deviceId → 上次尝试时间
     private ClipboardSnapshot? _lockedPending;  // D-16：锁屏缓存（仅最新一条），解锁补写
 
     public Action<string>? Log { get; set; }
@@ -45,6 +47,7 @@ public sealed class SyncEngine : IDisposable
         _server.OnHello = OnPhoneHello;
         _server.OnPairOk = OnPairOkResult;
         _server.OwnHelloProvider = OwnHello;
+        StartUdpDiscovery();
         _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "clipport-sync" };
         _worker.Start();
         _screenGate.Unlocked += () => _queue.TryAdd(() =>
@@ -227,6 +230,48 @@ public sealed class SyncEngine : IDisposable
             }
             catch (Exception ex) { Log?.Invoke($"connect peer {host}:{port} failed: {ex.Message}"); }
         });
+    }
+
+    /// <summary>M8: UDP 广播发现——通告自己 + 监听对端；已配对对端出现时自动建链。</summary>
+    private void StartUdpDiscovery()
+    {
+        try
+        {
+            _udp = new Net.UdpDiscovery();
+            if (Log != null) _udp.StatusLog += Log;
+            _udp.OnAnnounced += (id, name, type, port, fp, ip) =>
+                _queue.TryAdd(() => HandleAnnounced(id, name, type, port, fp, ip));
+            _udp.Start(_cfg.DeviceId, () =>
+            {
+                var fpHex = OwnFpProvider?.Invoke();
+                return (_cfg.DeviceName, 0, _cfg.TcpPort, fpHex is null ? "" : Convert.ToHexString(fpHex));
+            });
+        }
+        catch (Exception ex) { Log?.Invoke("udp discovery failed: " + ex.Message); }
+    }
+
+    private void HandleAnnounced(string id, string name, int type, int port, string fp, string ip)
+    {
+        try
+        {
+            var knownFp = Peers.FingerprintOf(id);
+            var paired = knownFp is not null || _cfg.PairedPhoneId == id;
+            Peers.Upsert(id, name, fp.Length >= 16 ? fp : knownFp, $"{ip}:{port}");
+            if (!paired)
+            {
+                Log?.Invoke($"发现未配对设备 {name} ({ip}:{port})——配对后才可同步");
+                return;
+            }
+            // 已配对：自动建链。确定性仲裁：仅 deviceId 较小的一方主动连出，避免双向重复建链
+            if (string.CompareOrdinal(_cfg.DeviceId, id) > 0) return;
+            if (_server.HasAliveLinkTo(id)) return;
+            if (_connectAttempts.TryGetValue(id, out var last) && DateTime.UtcNow - last < TimeSpan.FromSeconds(15)) return;
+            _connectAttempts[id] = DateTime.UtcNow;
+            Log?.Invoke($"自动连接已配对设备 {name} ({ip}:{port})");
+            var ep = ip.Split(':');
+            ConnectPeer(ip, port, null);
+        }
+        catch (Exception ex) { Log?.Invoke("announce handle error: " + ex.Message); }
     }
 
     /// <summary>启动时对已知端点的对端发起重连（二期自动组网的第一步）。</summary>

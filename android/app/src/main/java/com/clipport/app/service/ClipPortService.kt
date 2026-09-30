@@ -44,6 +44,8 @@ class ClipPortService : Service() {
         manager?.connect(pinned = Prefs(this).serverFpHex != null)
     }
 
+    fun openPairing(): String? = manager?.openPairing()
+
     private var manager: SyncManager? = null
     private var listener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var cm: ClipboardManager? = null
@@ -60,6 +62,7 @@ class ClipPortService : Service() {
             statusText = s
             android.util.Log.i("ClipPortService", s)
         }
+        manager?.startServerRole()
         manager?.connect(pinned = prefs.serverFpHex != null)
 
         cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
