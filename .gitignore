@@ -12,4 +12,6 @@ local.properties
 keystore.properties
 .DS_Store
 docs/
+.zcodeignore
+
 

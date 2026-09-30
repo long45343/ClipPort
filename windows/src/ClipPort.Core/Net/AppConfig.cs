@@ -25,7 +25,7 @@ public sealed class AppConfig
         try
         {
             if (File.Exists(Path_))
-                return JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(Path_)) ?? new AppConfig();
+                return JsonSerializer.Deserialize(File.ReadAllText(Path_), ClipPortJsonContext.Default.AppConfig) ?? new AppConfig();
         }
         catch { }
         var cfg = new AppConfig { DeviceId = Guid.NewGuid().ToString("N") };
@@ -36,7 +36,7 @@ public sealed class AppConfig
     public void Save()
     {
         Directory.CreateDirectory(CertManager.StoreDir);
-        File.WriteAllText(Path_, JsonSerializer.Serialize(this));
+        File.WriteAllText(Path_, JsonSerializer.Serialize(this, ClipPortJsonContext.Default.AppConfig));
     }
 
     public static byte[] CodeHash(string code) => SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("clipport:" + code.Trim()));

@@ -1,4 +1,6 @@
+#if ENABLE_WINRT_BLE
 using Windows.Devices.Bluetooth.Advertisement;
+#endif
 
 namespace ClipPort.Core.Net;
 
@@ -9,7 +11,9 @@ namespace ClipPort.Core.Net;
 /// </summary>
 public sealed class BleWatcher
 {
+#if ENABLE_WINRT_BLE
     private BluetoothLEAdvertisementWatcher? _watcher;
+#endif
     public event Action<(string Ip, ushort Port, byte[] FpPrefix)>? EndpointFound;
 
     private readonly byte[] _expectedFpPrefix;
@@ -21,22 +25,26 @@ public sealed class BleWatcher
 
     public void Start()
     {
+#if ENABLE_WINRT_BLE
         _watcher = new BluetoothLEAdvertisementWatcher
         {
             ScanningMode = BluetoothLEScanningMode.Active,
         };
         _watcher.Received += OnReceived;
         _watcher.Start();
+#endif
     }
 
     public void Stop()
     {
+#if ENABLE_WINRT_BLE
         if (_watcher is not null)
         {
             try { _watcher.Stop(); } catch { }
             _watcher.Received -= OnReceived;
             _watcher = null;
         }
+#endif
     }
 
     public static byte[] BuildPayload(System.Net.IPAddress ip, ushort port, byte[] fp)
@@ -48,6 +56,7 @@ public sealed class BleWatcher
         return buf.ToArray();
     }
 
+#if ENABLE_WINRT_BLE
     private void OnReceived(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementReceivedEventArgs args)
     {
         foreach (var section in args.Advertisement.ManufacturerData)
@@ -63,4 +72,5 @@ public sealed class BleWatcher
             try { EndpointFound?.Invoke((ip.ToString(), port, bytes[8..12])); } catch { }
         }
     }
+#endif
 }

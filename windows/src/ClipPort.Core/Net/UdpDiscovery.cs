@@ -53,7 +53,16 @@ public sealed class UdpDiscovery : IDisposable
         try
         {
             var (name, type, port, fp) = _selfInfo();
-            var json = JsonSerializer.Serialize(new { id = _selfId, name, type, port, fp, v = 1 });
+            var packet = new UdpAnnouncePacket
+            {
+                id = _selfId,
+                name = name,
+                type = type,
+                port = port,
+                fp = fp,
+                v = 1
+            };
+            var json = JsonSerializer.Serialize(packet, ClipPortJsonContext.Default.UdpAnnouncePacket);
             var data = Encoding.UTF8.GetBytes(json);
             // 1) 受限广播
             try

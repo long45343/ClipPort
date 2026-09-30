@@ -26,7 +26,7 @@ public sealed class PeerStore
         try
         {
             if (File.Exists(Path_))
-                return JsonSerializer.Deserialize<PeerStore>(File.ReadAllText(Path_)) ?? new PeerStore();
+                return JsonSerializer.Deserialize(File.ReadAllText(Path_), ClipPortJsonContext.Default.PeerStore) ?? new PeerStore();
         }
         catch { }
         return new PeerStore();
@@ -37,7 +37,7 @@ public sealed class PeerStore
         lock (_gate)
         {
             Directory.CreateDirectory(CertManager.StoreDir);
-            File.WriteAllText(Path_, JsonSerializer.Serialize(this));
+            File.WriteAllText(Path_, JsonSerializer.Serialize(this, ClipPortJsonContext.Default.PeerStore));
         }
     }
 

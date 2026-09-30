@@ -1,9 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
-    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
-    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <RootNamespace>ClipPort.App</RootNamespace>
     <AssemblyName>ClipPort</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -14,6 +12,13 @@
     <LangVersion>latest</LangVersion>
     <Version>0.3.0</Version>
     <InformationalVersion>0.3.0</InformationalVersion>
+    
+    <!-- .NET 10 ILLink 裁剪与单文件配置（仅自包含发布时启用） -->
+    <PublishTrimmed Condition="'$(SelfContained)' == 'true'">true</PublishTrimmed>
+    <TrimMode Condition="'$(SelfContained)' == 'true'">partial</TrimMode>
+    <_SuppressWpfTrimError Condition="'$(SelfContained)' == 'true'">true</_SuppressWpfTrimError>
+    <EnableCompressionInSingleFile Condition="'$(SelfContained)' == 'true'">true</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract Condition="'$(SelfContained)' == 'true'">true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
