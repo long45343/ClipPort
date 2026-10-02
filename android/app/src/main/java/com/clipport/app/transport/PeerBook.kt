@@ -38,7 +38,11 @@ class PeerBook(context: Context) {
     fun upsert(deviceId: String, name: String?, certFpHex: String?, endpoint: String?, markPaired: Boolean = false): PeerEntry {
         val e = items.getOrPut(deviceId) { PeerEntry(deviceId) }
         if (!name.isNullOrEmpty()) e.name = name
-        if (!certFpHex.isNullOrEmpty()) e.certFpHex = certFpHex
+        // B-10 指纹只增不减：完整指纹（64 hex）不截断；短值（旧版 UDP 截断 fp）不覆盖长值
+        val existingFp = e.certFpHex
+        if (!certFpHex.isNullOrEmpty() && (existingFp == null || certFpHex.length >= existingFp.length)) {
+            e.certFpHex = certFpHex
+        }
         if (!endpoint.isNullOrEmpty()) e.endpoint = endpoint
         if (markPaired) e.paired = true
         e.lastSeen = System.currentTimeMillis()

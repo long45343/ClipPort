@@ -41,9 +41,11 @@ class PcLink private constructor(
         /** 服务端角色：收到 PAIR_REQ（返回是否接受配对）。 */
         fun onPairRequest(link: PcLink, hash: ByteArray, joinerFp: ByteArray?): Boolean
         fun onFileShareChunk(chunk: FileShareChunk) {}
+        fun onCancel(link: PcLink, seq: Long) {}
     }
 
     companion object {
+        const val HARD_TIMEOUT_MS = 20_000L // 20 秒全局硬超时（对齐小米）
         /** 主动连出（client 模式）。trustAny 用于首次配对模式（TOFU 临时建立通道以发起 PAIR_REQ 挑战）。 */
         fun client(
             host: String,
@@ -111,6 +113,10 @@ class PcLink private constructor(
     private fun attachServerSide(s: SSLSocket) {
         s.soTimeout = 0
         onStep("对端接入 ${s.inetAddress?.hostAddress}")
+        // 对称计算对端证书指纹（B-5）：服务端侧同样可用于身份落库与 legacy 指纹迁移
+        serverFp = try {
+            MessageDigest.getInstance("SHA-256").digest(s.session.peerCertificates[0].encoded)
+        } catch (_: Exception) { null }
         attach(s)
     }
 
@@ -203,6 +209,11 @@ class PcLink private constructor(
                 val chunk = FileShareChunk.decode(payload)
                 listener.onFileShareChunk(chunk)
             }
+            FrameCodec.CANCEL -> {
+                // 对端取消了请求：如果本地有挂起的等待响应，取消并清理
+                pending.remove(seq)?.cancel()
+                listener.onCancel(this, seq)
+            }
         }
     }
 
@@ -221,21 +232,33 @@ class PcLink private constructor(
         }
     }
 
-    /** 发起 REQ_TEXT 并等待响应（懒拉取大内容）。 */
-    fun requestText(req: TextRequest, timeoutMs: Long = 15_000): TextResponse? {
+    /** 发起 REQ_TEXT 并等待响应（懒拉取大内容，带 20s 硬超时与 CANCEL 熔断）。 */
+    fun requestText(req: TextRequest, timeoutMs: Long = HARD_TIMEOUT_MS): TextResponse? {
         val rid = nextSeq()
         val deferred = kotlinx.coroutines.CompletableDeferred<TextResponse>()
         pending[rid] = deferred
         send(FrameCodec.REQ_TEXT, rid, req.encode())
-        val result = kotlinx.coroutines.runBlocking {
-            kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { deferred.await() }
+        return try {
+            val result = kotlinx.coroutines.runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { deferred.await() }
+            }
+            if (result == null) {
+                // 20 秒超时熔断：向对端发送 0x18 CANCEL，释放对端推流句柄
+                Log.w("PcLink", "requestText timeout after ${timeoutMs}ms, sending CANCEL for seq $rid")
+                send(FrameCodec.CANCEL, rid, ByteArray(0))
+            }
+            result
+        } finally {
+            pending.remove(rid)
         }
-        pending.remove(rid)
-        return result
     }
 
     fun close() {
         alive = false
+        pending.values.forEach { it.cancel() }
+        pending.clear()
+        try { input?.close() } catch (_: Exception) {}
+        try { output?.close() } catch (_: Exception) {}
         try { ssl?.close() } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
     }

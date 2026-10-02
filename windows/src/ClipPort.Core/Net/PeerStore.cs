@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace ClipPort.Core.Net;
 
-/// <summary>对等设备信息（二期对等模式）。</summary>
+/// <summary>对等设备信息（二期对等模式）。配对事实源：Paired 标志（D-35=B 单一事实源）。</summary>
 public sealed class PeerInfo
 {
     public string DeviceId { get; set; } = "";      // 32 hex
@@ -12,6 +12,8 @@ public sealed class PeerInfo
     public string? CertFpHex { get; set; }
     public string? LastEndpoint { get; set; }        // "ip:port"
     public DateTime LastSeen { get; set; }
+    /// <summary>是否已配对（唯一配对事实源，D-35=B / D-37：无旧数据兼容路径）。</summary>
+    public bool Paired { get; set; }
 }
 
 /// <summary>对端库持久化（%LOCALAPPDATA%\ClipPort\peers.json）。</summary>
@@ -41,8 +43,8 @@ public sealed class PeerStore
         }
     }
 
-    /// <summary>按 HELLO/PAIR 信息登记或更新对端；返回条目。</summary>
-    public PeerInfo Upsert(string deviceId, string name, string? certFpHex, string? endpoint)
+    /// <summary>按 HELLO/PAIR 信息登记或更新对端；返回条目。指纹只增不减（短值不覆盖长值）。</summary>
+    public PeerInfo Upsert(string deviceId, string name, string? certFpHex, string? endpoint, bool markPaired = false)
     {
         lock (_gate)
         {
@@ -53,8 +55,10 @@ public sealed class PeerStore
                 Peers.Add(p);
             }
             if (!string.IsNullOrEmpty(name)) p.Name = name;
-            if (!string.IsNullOrEmpty(certFpHex)) p.CertFpHex = certFpHex;
+            if (!string.IsNullOrEmpty(certFpHex) &&
+                (p.CertFpHex is null || certFpHex.Length >= p.CertFpHex.Length)) p.CertFpHex = certFpHex;
             if (!string.IsNullOrEmpty(endpoint)) p.LastEndpoint = endpoint;
+            if (markPaired) p.Paired = true;
             p.LastSeen = DateTime.UtcNow;
             return p;
         }

@@ -62,6 +62,9 @@ object PeerIdentity {
 
     /** 纯原生极简 ASN.1 DER 自签 X.509 v3 证书 */
     private fun selfSign(kp: KeyPair, cn: String): X509Certificate {
+        // 0. X.509 v3 版本号: [0] EXPLICIT INTEGER 2 (v3)
+        val version = byteArrayOf(0xA0.toByte(), 0x03, 0x02, 0x01, 0x02)
+
         // 1. sha256WithRSAEncryption: 1.2.840.113549.1.1.11
         val sigAlgId = byteArrayOf(
             0x30, 0x0D,
@@ -98,9 +101,10 @@ object PeerIdentity {
         // 5. SubjectPublicKeyInfo (直接使用公钥原生标准 DER 编码)
         val spki = kp.public.encoded
 
-        // 6. TBSCertificate
+        // 6. TBSCertificate (v3 格式)
         val tbsCertificate = derSequence(
             0x30,
+            version,
             serial,
             sigAlgId,
             name,

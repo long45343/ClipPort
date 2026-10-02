@@ -47,6 +47,12 @@ public sealed class UdpDiscovery : IDisposable
         StatusLog?.Invoke("UDP 发现已启动 (47192/udp, 10s 周期)");
     }
 
+    /// <summary>即刻触发一次全网卡广播宣告（D-32=A）</summary>
+    public void BroadcastNow()
+    {
+        SendAnnounce();
+    }
+
     private async void SendAnnounce()
     {
         if (_selfInfo is null) return;

@@ -87,25 +87,32 @@ object LanDiscovery {
         return o.toString().toByteArray(Charsets.UTF_8)
     }
 
+    fun broadcastNow() {
+        if (!running) return
+        Thread({
+            try {
+                val data = announcePacket()
+                val any = InetAddress.getByName("255.255.255.255")
+                socket?.send(DatagramPacket(data, data.size, any, UDP_PORT))
+                // 子网定向广播（每接口）
+                java.net.NetworkInterface.getNetworkInterfaces().asSequence()
+                    .filter { it.isUp && !it.isLoopback }
+                    .forEach { nif ->
+                        nif.interfaceAddresses.forEach { ia ->
+                            val bc = ia.broadcast ?: return@forEach
+                            try { socket?.send(DatagramPacket(data, data.size, bc, UDP_PORT)) } catch (_: Exception) {}
+                        }
+                    }
+            } catch (e: Exception) {
+                Log.w("UdpDiscovery", "broadcastNow error", e)
+            }
+        }, "clipport-udp-tx-burst").apply { isDaemon = true; start() }
+    }
+
     private fun sendLoop() {
         Thread({
             while (running) {
-                try {
-                    val data = announcePacket()
-                    val any = InetAddress.getByName("255.255.255.255")
-                    socket?.send(DatagramPacket(data, data.size, any, UDP_PORT))
-                    // 子网定向广播（每接口）
-                    java.net.NetworkInterface.getNetworkInterfaces().asSequence()
-                        .filter { it.isUp && !it.isLoopback }
-                        .forEach { nif ->
-                            nif.interfaceAddresses.forEach { ia ->
-                                val bc = ia.broadcast ?: return@forEach
-                                try { socket?.send(DatagramPacket(data, data.size, bc, UDP_PORT)) } catch (_: Exception) {}
-                            }
-                        }
-                } catch (e: Exception) {
-                    Log.w("UdpDiscovery", "send", e)
-                }
+                broadcastNow()
                 try { Thread.sleep(10_000) } catch (_: InterruptedException) { return@Thread }
             }
         }, "clipport-udp-tx").apply { isDaemon = true; start() }

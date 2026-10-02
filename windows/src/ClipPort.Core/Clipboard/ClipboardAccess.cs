@@ -11,6 +11,13 @@ public sealed class ClipboardSnapshot
     public string? Html;
     public byte[]? ImagePng;
     public bool IsEmpty => Text is null && Html is null && ImagePng is null;
+
+    /// <summary>内容指纹比对（第 4 道过滤核心，D-07-B"内容没变不重发"）：三元组完全一致视为同一内容。</summary>
+    public bool ContentEquals(ClipboardSnapshot? other) =>
+        other is not null &&
+        Text == other.Text && Html == other.Html &&
+        ((ImagePng is null && other.ImagePng is null) ||
+         (ImagePng is not null && other.ImagePng is not null && ImagePng.AsSpan().SequenceEqual(other.ImagePng)));
 }
 
 /// <summary>

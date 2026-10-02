@@ -64,6 +64,16 @@ public partial class MainWindow : FluentWindow
         AppendLog("配对窗口已开启，支持手机扫码或输入 6 位码配对");
     }
 
+    /// <summary>B-11：配对完成后收起二维码/配对码面板（被拒绝时保留供重试）。</summary>
+    public void OnPairingCompleted(bool success)
+    {
+        if (!success) return;
+        QrBorder.Visibility = Visibility.Collapsed;
+        QrImage.Source = null;
+        PairCodeText.Text = "";
+        AppendLog("配对成功，配对窗口已关闭");
+    }
+
     private static System.Windows.Media.Imaging.BitmapImage ToBitmapImage(byte[] pngBytes)
     {
         var bitmap = new System.Windows.Media.Imaging.BitmapImage();

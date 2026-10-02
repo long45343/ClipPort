@@ -105,4 +105,14 @@ public class FileShareManager
             }
         }
     }
+
+    /// <summary>清理并释放所有正在接收的未完成文件流句柄（D-33=A）</summary>
+    public void Reset()
+    {
+        foreach (var fs in _incomingFiles.Values)
+        {
+            try { fs.Dispose(); } catch { }
+        }
+        _incomingFiles.Clear();
+    }
 }

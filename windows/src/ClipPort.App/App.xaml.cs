@@ -87,16 +87,9 @@ public partial class App : Application
             var cert = _ownCert ?? CertManager.GetOrCreate();
             _ownCert = cert;
             Server!.Start(Config.TcpPort, cert);
-            var fp = CertManager.Fingerprint(cert);
-            try
-            {
-                BlePublisher.StatusLog = OnEngineLog;
-                BlePublisher.Start(Config.TcpPort, fp);
-            }
-            catch (Exception ex) { OnEngineLog("ble 广播不可用: " + ex.Message); }
-            var ips = BlePublisher.AllLanIpv4().Select(a => a.ToString()).ToList();
+            var ips = NetworkHelper.AllLanIpv4().Select(a => a.ToString()).ToList();
             var addrText = string.Join("  ", ips.Select(ip => $"{ip}:{Config.TcpPort}"));
-            OnEngineLog($"本机地址: {addrText}（UDP广播与BLE发现运行中）");
+            OnEngineLog($"本机地址: {addrText}（UDP 广播发现运行中）");
             Dispatcher.BeginInvoke(() => _main?.SetLocalIp(addrText));
         }
         catch (Exception ex) { OnEngineLog("server start failed: " + ex.Message); }
@@ -122,7 +115,7 @@ public partial class App : Application
 
     public string BuildPairingUri(string code)
     {
-        var ip = BlePublisher.AllLanIpv4().FirstOrDefault()?.ToString() ?? "127.0.0.1";
+        var ip = NetworkHelper.PreferredLanIpv4()?.ToString() ?? NetworkHelper.AllLanIpv4().FirstOrDefault()?.ToString() ?? "127.0.0.1";
         var fp = _ownCert is null ? "" : Convert.ToHexString(CertManager.Fingerprint(_ownCert)).ToLowerInvariant();
         var name = Uri.EscapeDataString(Config.DeviceName);
         return $"clipport://pair?host={ip}&port={Config.TcpPort}&code={code}&fp={fp}&name={name}";
@@ -139,5 +132,14 @@ public partial class App : Application
 
     private void OnEngineLog(string msg) => Dispatcher.BeginInvoke(() => _main?.AppendLog(msg));
 
-    private void OnStatus(string s) => Dispatcher.BeginInvoke(() => _main?.SetStatus(s));
+    private void OnStatus(string s)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            _main?.SetStatus(s);
+            // B-11：配对成功即收起二维码/配对码面板；被拒绝时保留面板供重试
+            if (s == "paired" || s == "paired (idempotent)")
+                _main?.OnPairingCompleted(success: true);
+        });
+    }
 }

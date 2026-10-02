@@ -25,23 +25,23 @@ class ClipPortService : Service() {
         const val CHANNEL_ID = "hide_foreground"
         const val NOTIFICATION_ID = 1
         const val ACTION_START = "com.clipport.app.START"
+        const val ACTION_PAIR = "com.clipport.app.PAIR"
         @Volatile var running = false
         @Volatile var statusText = "未启动"
         @Volatile var instance: ClipPortService? = null
     }
 
-    fun requestPair() {
+    fun requestPair(host: String? = null, port: Int? = null, code: String? = null) {
         val m = manager ?: return
-        m.pairingMode = true
-        m.connect(pinned = false)
-    }
-
-    fun requestDiscovery() {
-        manager?.startAutoDiscover()
+        val p = Prefs(this)
+        val targetHost = host ?: p.manualHost ?: run { statusText = "请先填写 PC 地址或扫码"; return }
+        val targetPort = port ?: p.manualPort
+        val targetCode = code ?: p.pairingCode.ifEmpty { run { statusText = "配对码为空"; return } }
+        m.requestPair(targetHost, targetPort, targetCode)
     }
 
     fun requestConnect() {
-        manager?.connect(pinned = Prefs(this).serverFpHex != null)
+        manager?.connectManual()
     }
 
     fun openPairing(): String? = manager?.openPairing()
@@ -54,6 +54,7 @@ class ClipPortService : Service() {
     private var listener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var cm: ClipboardManager? = null
     private var logcatWatcher: com.clipport.app.clip.LogcatClipboardWatcher? = null
+    private var networkWatcher: com.clipport.app.transport.NetworkWatcher? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -68,7 +69,9 @@ class ClipPortService : Service() {
             android.util.Log.i("ClipPortService", s)
         }
         manager?.startServerRole()
-        manager?.connect(pinned = prefs.serverFpHex != null)
+        // B-6 纯对等启动：手动目标直连 + 对端库已配对端点仲裁重连（UDP 通告随后接管在线感知）
+        manager?.connectManual()
+        manager?.reconnectKnownPeers()
 
         cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val l = ClipboardManager.OnPrimaryClipChangedListener {
@@ -89,13 +92,29 @@ class ClipPortService : Service() {
             android.util.Log.i("ClipPortService", msg)
         }
         logcatWatcher?.start()
+
+        // 注册实时网络状态感知（D-31=A）
+        networkWatcher = com.clipport.app.transport.NetworkWatcher(
+            context = this,
+            onNetworkAvailable = { isWifi ->
+                manager?.onNetworkAvailable(isWifi)
+            },
+            onNetworkLost = {
+                manager?.onNetworkLost()
+            }
+        ).apply { start() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_PAIR) {
+            requestPair()
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
+        networkWatcher?.stop()
+        networkWatcher = null
         logcatWatcher?.stop()
         logcatWatcher = null
         listener?.let { cm?.removePrimaryClipChangedListener(it) }

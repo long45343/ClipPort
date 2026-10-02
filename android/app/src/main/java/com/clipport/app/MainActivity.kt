@@ -53,8 +53,7 @@ data class PairTarget(
 )
 
 /** 主界面（D-12：Compose Material 3 设置页，兼作 Xposed 配置宿主）。
- *  权限门控启动：先申请运行时权限，全部落定后才启动前台服务（connectedDevice 类型
- *  在 Android 12+ 要求已持有 BLUETOOTH_CONNECT，先斩后奏会 SecurityException 闪退）。 */
+ *  权限门控启动：先申请运行时权限，全部落定后才启动前台服务。 */
 class MainActivity : ComponentActivity() {
     private val prefs by lazy { Prefs(this) }
     private val peerBook by lazy { PeerBook(this) }
@@ -94,7 +93,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /// 权限落定后要执行的续作：null=仅启动服务；"pair"=配对；"discover"=自动发现
+    /// 权限落定后要执行的续作：null=仅启动服务；"pair"=配对
     private var pendingAction: String? = null
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
@@ -105,18 +104,17 @@ class MainActivity : ComponentActivity() {
         }
         when (pendingAction) {
             "pair" -> { saveAndPair(); pendingAction = null }
-            "discover" -> { doAutoDiscover(); pendingAction = null }
             else -> startServiceSafely()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        host = prefs.host ?: ""
-        port = prefs.port.toString()
+        host = prefs.manualHost ?: ""
+        port = prefs.manualPort.toString()
         clearMinutes = (prefs.clearMs / 60000).toString()
         syncEnabled = prefs.syncEnabled
-        paired = prefs.serverFpHex != null
+        paired = isPaired()   // B-8：配对状态派生自 PeerBook（双向配对均有效）
         status = if (ClipPortService.running) ClipPortService.statusText else "申请权限中…"
 
         requestEssentialPermissions(then = null)
@@ -130,11 +128,15 @@ class MainActivity : ComponentActivity() {
                 if (ClipPortService.statusText.isNotBlank() && status != ClipPortService.statusText)
                     status = ClipPortService.statusText
                 peers = peerBook.all()
+                paired = isPaired()
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this, 1000)
             }
         }
         android.os.Handler(android.os.Looper.getMainLooper()).post(poll)
     }
+
+    /** B-8：配对状态唯一事实源 = PeerBook 中存在 paired 条目（双向配对均生效）。 */
+    private fun isPaired(): Boolean = peerBook.all().any { it.paired }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -182,18 +184,11 @@ class MainActivity : ComponentActivity() {
         pendingAction = then
         val needed = buildList {
             if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-            if (Build.VERSION.SDK_INT >= 31) {
-                add(Manifest.permission.BLUETOOTH_CONNECT)
-                add(Manifest.permission.BLUETOOTH_SCAN)
-            } else {
-                add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
         }.filter { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
 
         if (needed.isEmpty()) {
             when (pendingAction) {
                 "pair" -> { saveAndPair(); pendingAction = null }
-                "discover" -> { doAutoDiscover(); pendingAction = null }
                 else -> startServiceSafely()
             }
         } else {
@@ -263,7 +258,7 @@ class MainActivity : ComponentActivity() {
                 }
                 OutlinedTextField(
                     value = host, onValueChange = { host = it },
-                    label = { Text("PC 地址（自动发现时免填）") }, modifier = Modifier.fillMaxWidth(),
+                    label = { Text("PC 地址（手动连接目标，可留空由 UDP 自动发现）") }, modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                 )
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -287,8 +282,6 @@ class MainActivity : ComponentActivity() {
                     }
                     Button(onClick = {
                         prefs.pairingCode = code
-                        prefs.serverFpHex = null
-                        paired = false
                         ClipPortService.statusText = "配对中…"
                         status = "配对中…"
                         requestEssentialPermissions(then = "pair")
@@ -296,8 +289,8 @@ class MainActivity : ComponentActivity() {
                         Text(if (paired) "重新配对" else "配对")
                     }
                     Button(onClick = {
-                        prefs.host = host.trim()
-                        prefs.port = port.toIntOrNull() ?: 47190
+                        prefs.manualHost = host.trim()
+                        prefs.manualPort = port.toIntOrNull() ?: 47190
                         status = "连接中…"
                         requestEssentialPermissions(then = null)
                     }, enabled = host.isNotBlank()) {
@@ -433,17 +426,15 @@ class MainActivity : ComponentActivity() {
                             host = target.host
                             port = target.port
                             code = target.code
-                            prefs.host = target.host
-                            prefs.port = target.port.toIntOrNull() ?: 47190
+                            prefs.manualHost = target.host
+                            prefs.manualPort = target.port.toIntOrNull() ?: 47190
                             prefs.pairingCode = target.code
-                            prefs.serverFpHex = null
-                            paired = false
                             ClipPortService.statusText = "配对中…"
                             status = "配对中…"
-                            startServiceSafely()
-                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                ClipPortService.instance?.requestPair()
-                            }, 500)
+                            try {
+                                startForegroundService(Intent(this@MainActivity, ClipPortService::class.java).setAction(ClipPortService.ACTION_PAIR))
+                            } catch (_: Exception) {}
+                            ClipPortService.instance?.requestPair(target.host, target.port.toIntOrNull() ?: 47190, target.code)
                         }) {
                             Text("确认配对")
                         }
@@ -460,25 +451,17 @@ class MainActivity : ComponentActivity() {
 
     /** 配对：权限落定 → saveAndPair 启动服务并发 PAIR_REQ。 */
     private fun saveAndPair() {
-        // 自动发现已写入 host 而输入框为空时，不得覆盖（否则连接因无地址而静默失效）
-        if (host.isNotBlank()) prefs.host = host.trim()
-        prefs.port = port.toIntOrNull() ?: 47190
-        prefs.serverFpHex = null
-        paired = false
+        // 手动输入的地址不得被覆盖（否则连接因无地址而静默失效）
+        if (host.isNotBlank()) prefs.manualHost = host.trim()
+        val p = port.toIntOrNull() ?: 47190
+        prefs.manualPort = p
+        prefs.pairingCode = code
         ClipPortService.statusText = "配对中…"
         status = "配对中…"
-        startServiceSafely()
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            ClipPortService.instance?.requestPair()
-        }, 500)
-    }
-
-    private fun doAutoDiscover() {
-        status = "发现中…"
-        startServiceSafely()
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            ClipPortService.instance?.requestDiscovery()
-        }, 500)
+        try {
+            startForegroundService(Intent(this, ClipPortService::class.java).setAction(ClipPortService.ACTION_PAIR))
+        } catch (_: Exception) {}
+        ClipPortService.instance?.requestPair(prefs.manualHost, p, code)
     }
 
     /** 数字输入规范化：中文输入法的全角数字(１２３)显示与半角无法分辨但字节不同，
@@ -489,10 +472,7 @@ class MainActivity : ComponentActivity() {
             .joinToString("")
 
     private fun shortName(permission: String): String = when (permission) {
-        Manifest.permission.BLUETOOTH_CONNECT -> "蓝牙连接"
-        Manifest.permission.BLUETOOTH_SCAN -> "蓝牙扫描"
         Manifest.permission.POST_NOTIFICATIONS -> "通知"
-        Manifest.permission.ACCESS_FINE_LOCATION -> "定位"
         else -> permission.substringAfterLast('.')
     }
 }

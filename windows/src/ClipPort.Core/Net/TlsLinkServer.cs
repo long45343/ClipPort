@@ -26,15 +26,21 @@ public sealed class TlsLinkServer : IAsyncDisposable
     /// <summary>本端作为加入方时收到 PAIR_OK（对端=acceptor）。</summary>
     public Action<PhoneLink, bool, byte[], string>? OnPairOk { get; set; }
     public Func<PhoneLink, byte[], byte[]?, bool>? OnPairRequest { get; set; }      // 入参 link+codeHash，返回是否配对成功
-    public Action<ClipBroadcast>? OnBroadcast { get; set; }
+    public Action<PhoneLink, ClipBroadcast>? OnBroadcast { get; set; }
     /// <summary>手机间中继开关（多设备同步：A 手机的内容转发给其他已配对链接）。</summary>
     public bool RelayEnabled { get; set; } = true;
     public Func<TextRequest, TextResponse>? OnTextRequest { get; set; }
     public Action<FileShareChunk>? OnFileShareChunk { get; set; }
+    public Action<PhoneLink, uint>? OnCancel { get; set; }
     public Action<string>? Log { get; set; }
 
     public bool HasConnectedPhone => _links.Count > 0;
-    public PhoneLink? PrimaryLink { get { lock (_gate) return _links.FirstOrDefault(l => l.Alive && l.Paired); } }
+
+    /// <summary>存活链路快照（B-3 多源内容服务用；替代已删除的 PrimaryLink 单链路语义）。</summary>
+    public IReadOnlyList<PhoneLink> LinksSnapshot()
+    {
+        lock (_gate) return _links.ToList();
+    }
 
     public void Start(ushort port, X509Certificate2 cert)
     {
@@ -272,10 +278,12 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     break;
                 case FrameCodec.Hello:
                     PeerHello = Hello.Decode(payload);
+                    _owner.Log?.Invoke($"收到对端 HELLO: name={PeerHello.Name} id={Convert.ToHexString(PeerHello.DeviceId)[..Math.Min(8, PeerHello.DeviceId.Length * 2)]}…");
                     _owner.OnHello?.Invoke(this, PeerHello);   // ★ 设备ID就绪后才触发, 重连方能恢复 Paired 态
                     break;
                 case FrameCodec.PairReq:
                     var (pairHash, joinerFp) = Pairing.DecodePairReq(payload);   // ★ 此前漏了解码, 整条 protobuf 消息被当成哈希比对
+                    _owner.Log?.Invoke($"收到对端配对请求: hash={Convert.ToHexString(pairHash)[..Math.Min(8, pairHash.Length * 2)]}…");
                     bool ok = _owner.OnPairRequest?.Invoke(this, pairHash, joinerFp) ?? false;
                     if (ok) Paired = true;   // ★ 配对成功立即标记，否则 PC 永远不会向该链接推送
                     _ = SendAsync(FrameCodec.Encode(FrameCodec.PairOk, seq,
@@ -283,7 +291,7 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     break;
                 case FrameCodec.ClipBroadcast:
                     var bc = ClipBroadcast.Decode(payload);
-                    _owner.OnBroadcast?.Invoke(bc);
+                    _owner.OnBroadcast?.Invoke(this, bc);   // B-3：携带来源链路（该对端即内容持有者）
                     if (_owner.RelayEnabled)
                         _owner.SendToAllExcept(this, FrameCodec.Encode(FrameCodec.ClipBroadcast, seq, payload));
                     break;
@@ -312,10 +320,18 @@ public sealed class TlsLinkServer : IAsyncDisposable
                     var chunk = FileShareChunk.Decode(payload);
                     _owner.OnFileShareChunk?.Invoke(chunk);
                     break;
+                case FrameCodec.Cancel:
+                    lock (_pending)
+                    {
+                        if (_pending.Remove(seq, out var tcsCancel))
+                            tcsCancel.TrySetCanceled();
+                    }
+                    _owner.OnCancel?.Invoke(this, seq);
+                    break;
             }
         }
 
-        /// <summary>向手机发送 REQ_TEXT 并等待 RESP_TEXT（服务端主动请求，seq 作关联 ID）。</summary>
+        /// <summary>向手机发送 REQ_TEXT 并等待 RESP_TEXT（带 20s 硬超时与 CANCEL 熔断，seq 作关联 ID）。</summary>
         public async Task<TextResponse> RequestTextAsync(TextRequest req, CancellationToken ct)
         {
             uint rid = _owner.NextSeq();
@@ -324,9 +340,14 @@ public sealed class TlsLinkServer : IAsyncDisposable
             try
             {
                 await SendAsync(FrameCodec.Encode(FrameCodec.ReqText, rid, req.Encode()));
-                var done = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(15), ct));
-                if (done != tcs.Task) throw new TimeoutException("resp_text timeout");
-                return tcs.Task.Result;
+                var done = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(20), ct));
+                if (done != tcs.Task)
+                {
+                    // 20s 硬超时熔断（D-33=A）：发送 0x18 CANCEL 帧告知对端停止推流
+                    _ = SendAsync(FrameCodec.Encode(FrameCodec.Cancel, rid, ReadOnlySpan<byte>.Empty));
+                    throw new TimeoutException("resp_text 20s hard timeout");
+                }
+                return await tcs.Task;
             }
             finally
             {
@@ -346,6 +367,11 @@ public sealed class TlsLinkServer : IAsyncDisposable
 
         public void Dispose()
         {
+            lock (_pending)
+            {
+                foreach (var tcs in _pending.Values) tcs.TrySetCanceled();
+                _pending.Clear();
+            }
             try { _tcp.Close(); } catch { }
             _ssl?.Dispose();
             _sendGate.Dispose();

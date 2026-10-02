@@ -15,6 +15,9 @@ object ClipConst {
     const val ECHO_WINDOW_MS = 1500L
     const val LAZY_THRESHOLD_BYTES = 16 * 1024 // D-05
     const val REMOTE_CLEAR_MS = 120_000L       // D-15 默认 120s
+
+    /** 第 4 道过滤（本地改写免疫）：发布后该窗口内内容完全一致的再次回调视为系统剪贴板管理器改写 */
+    const val LOCAL_REWRITE_GUARD_MS = 3000L
 }
 
 /** 三道过滤（spec §1.2）：自标记 → 时间戳 → 回声比对。 */
@@ -36,6 +39,15 @@ object ClipFilter {
         val cur = if (now > 0) clip.getItemAt(0).coerceToText(null)?.toString() else null
         return cur != null && cur == lastText
     }
+
+    /** 第 4 道过滤核心（D-07-B"内容没变不重发"思路）：文本/HTML/图片三元组完全一致视为同一内容。 */
+    fun sameContent(
+        text: String?, html: String?, image: ByteArray?,
+        lastText: String?, lastHtml: String?, lastImage: ByteArray?,
+    ): Boolean =
+        text == lastText && html == lastHtml &&
+            ((image == null && lastImage == null) ||
+             (image != null && lastImage != null && image.contentEquals(lastImage)))
 }
 
 /** mime 判定工具。 */

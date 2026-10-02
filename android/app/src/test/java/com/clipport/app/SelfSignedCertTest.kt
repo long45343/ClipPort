@@ -51,6 +51,9 @@ class SelfSignedCertTest {
         kpg.initialize(2048)
         val kp = kpg.generateKeyPair()
 
+        // 0. X.509 v3 版本号: [0] EXPLICIT INTEGER 2 (v3)
+        val version = byteArrayOf(0xA0.toByte(), 0x03, 0x02, 0x01, 0x02)
+
         // 1. sha256WithRSAEncryption: 1.2.840.113549.1.1.11
         val sigAlgId = byteArrayOf(
             0x30, 0x0D,
@@ -84,8 +87,9 @@ class SelfSignedCertTest {
         // 5. SubjectPublicKeyInfo: 直接使用公钥的原生 encoded
         val spki = kp.public.encoded
 
-        // 6. TBSCertificate
+        // 6. TBSCertificate (v3 格式)
         val tbsCertificate = derSequence(
+            version,
             serial,
             sigAlgId,
             name,      // issuer

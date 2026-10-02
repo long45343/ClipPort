@@ -14,8 +14,8 @@ import com.clipport.app.transport.PeerBook
 import com.clipport.app.transport.PeerIdentity
 import com.clipport.app.transport.PeerServer
 import com.clipport.app.transport.LanDiscovery
-import com.clipport.app.transport.PcDiscovery
 import com.clipport.app.transport.PcLink
+import com.clipport.app.transport.ReconnectStateMachine
 import java.security.MessageDigest
 
 /**
@@ -51,6 +51,45 @@ class SyncManager(
 
     @Volatile private var localPending = false
 
+    private var pendingReconnectRunnable: Runnable? = null
+    /** 自动建链目标（UDP 通告/网络事件携带），与手动目标（manualHost/manualPort）解耦（B-6/U-4）。 */
+    private data class AutoTarget(val deviceId: String, val host: String, val port: Int)
+    @Volatile private var autoConnectTarget: AutoTarget? = null
+    /** 最近一次 connectTo 的目标（配对成功后 pinned 重连用）。 */
+    @Volatile private var lastTarget: AutoTarget? = null
+
+    private val reconnectMachine = ReconnectStateMachine(
+        maxAttempts = 5,
+        backoffDelaysMs = longArrayOf(3000L, 6000L, 12000L, 60000L),
+        scheduler = { delay, action ->
+            val r = Runnable { action() }
+            pendingReconnectRunnable = r
+            handler.postDelayed(r, delay)
+        },
+        cancelScheduled = {
+            pendingReconnectRunnable?.let { handler.removeCallbacks(it) }
+            pendingReconnectRunnable = null
+        },
+        onExecuteConnect = {
+            val t = autoConnectTarget
+            if (t != null) {
+                val fp = peerBook.fingerprintOf(t.deviceId)?.joinToString("") { b -> "%02x".format(b) }
+                    ?.takeIf { it.length == 64 }
+                connectTo(t.host, t.port, pinnedFpHex = fp ?: pinnedFpHexFor(t.host, t.port))
+            } else {
+                connectManual()
+            }
+        },
+        onStateChanged = { state, delay, reason ->
+            when (state) {
+                ReconnectStateMachine.State.BACKOFF -> status("连接断开，${delay / 1000}s 后重试 ($reason)")
+                ReconnectStateMachine.State.FROZEN -> status("连续 5 次重连失败，进入休眠省电（等待对端上线或网络变动唤醒）")
+                ReconnectStateMachine.State.CONNECTING -> status("正在发起重连…")
+                ReconnectStateMachine.State.IDLE -> {}
+            }
+        }
+    )
+
     init {
         com.clipport.app.xposed.FloatingClipboardBridge.register { text, html ->
             onFloatingClipRead(text, html)
@@ -63,7 +102,9 @@ class SyncManager(
                 if (!prefs.syncEnabled) return@post
                 if (text.isNullOrEmpty() && html.isNullOrEmpty()) return@post
                 if (text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return@post
-                if (text == lastLocalPayload?.text && System.currentTimeMillis() - lastLocalAt < 1000) return@post
+                val last = lastLocalPayload
+                if (last != null && System.currentTimeMillis() - lastLocalAt < ClipConst.LOCAL_REWRITE_GUARD_MS &&
+                    ClipFilter.sameContent(text, html, null, last.text, last.html, last.imagePng)) return@post
                 val payload = ClipPayload(text, html, null)
                 publish(payload)
                 status("已通过悬浮降级通道读取并同步剪贴板")
@@ -112,6 +153,17 @@ class SyncManager(
             }
             if (text != null && text == lastEchoText && System.currentTimeMillis() - lastEchoAt < ClipConst.ECHO_WINDOW_MS) return // 防回声第3道
 
+            // 防改写第4道（D-07-B"内容没变不重发"）：窗口期内与刚发布内容完全一致 = 系统剪贴板管理器
+            // 剥私有标签、改时间戳后的回写（MIUI/HyperOS 剪贴板历史），跳过并吸收新时间戳基线
+            lastLocalPayload?.let { last ->
+                if (System.currentTimeMillis() - lastLocalAt < ClipConst.LOCAL_REWRITE_GUARD_MS &&
+                    ClipFilter.sameContent(text, htmlText, imagePng, last.text, last.html, last.imagePng)) {
+                    if (desc != null && desc.timestamp > 0) lastClipTimestamp = desc.timestamp
+                    Log.d(TAG, "skip publish: identical to last local within ${ClipConst.LOCAL_REWRITE_GUARD_MS}ms (system rewrite)")
+                    return
+                }
+            }
+
             if (desc != null && desc.timestamp > 0) {
                 lastClipTimestamp = desc.timestamp
             }
@@ -129,6 +181,8 @@ class SyncManager(
         val needChannel = size > ClipConst.LAZY_THRESHOLD_BYTES
         val seq = seqCounter.incrementAndGet()
         if (targets.isEmpty()) { status("已编码 seq=$seq 但无已配对连接，广播未送达"); return }
+        // 登记自身 (deviceId, seq)：多链路场景下 PC 中继回弹自己的广播时直接过滤，防止误当远端内容应用
+        dedupe.seen(prefs.deviceIdBytes().joinToString("") { b -> "%02x".format(b) }, seq)
         lastLocalPayload = payload
         lastLocalAt = System.currentTimeMillis()
         val mimes = ArrayList<Long>()
@@ -243,7 +297,9 @@ class SyncManager(
     override fun onPeerHello(link: PcLink, hello: Hello) {
         val id = hello.deviceId.joinToString("") { "%02x".format(it) }
         if (peerBook.known(id)) link.paired = true
-        peerBook.upsert(id, hello.name, null, link.remoteEndpoint)
+        // B-10：对端证书完整指纹（64 hex）落库（accepted 链路同样补算，见 PcLink.attachServerSide）
+        val certFpHex = link.serverFp?.joinToString("") { b -> "%02x".format(b) }
+        peerBook.upsert(id, hello.name, certFpHex, link.remoteEndpoint)
         status("对端: ${hello.name}（${if (link.paired) "已配对" else "未配对"}）")
     }
 
@@ -253,7 +309,9 @@ class SyncManager(
         val fpHex = link.peerTlsFp?.joinToString("") { b -> "%02x".format(b) }
         val idempotent = fpHex != null && peerBook.all().any { it.certFpHex == fpHex }
         return if (codeOk || idempotent) {
-            if (codeOk) { pairingOpen = false; pairingCodeHash = null }
+            // 无论码匹配还是幂等放行，都立即关闭配对窗口（终态必退出，参考 KDE Connect PairingHandler）
+            pairingOpen = false
+            pairingCodeHash = null
             peerBook.upsert(
                 link.peerHelloDeviceId ?: "unknown-${System.currentTimeMillis()}",
                 link.remoteName,
@@ -269,32 +327,39 @@ class SyncManager(
         }
     }
 
-    /** 本端作为加入方：PAIR_OK 结果处理（登记对端 + 指纹固定 + 重连）。 */
+    /** 本端作为加入方：PAIR_OK 结果处理（登记对端 + 标记当前链路 Paired，对齐 KDE Connect）。 */
     override fun onPairResult(link: PcLink, ok: Boolean, fp: ByteArray) {
+        // 对齐 KDE Connect PairingHandler：任何终态（成功/失败）都必须退出 Requested 态，绝不粘滞
+        handler.removeCallbacks(pairingTimeoutRunnable)
+        pairingMode = false
         if (ok && fp.isNotEmpty()) {
             val fpHex = fp.joinToString("") { "%02x".format(it) }
-            prefs.serverFpHex = fpHex
+            val id = link.peerHelloDeviceId ?: "peer-${fpHex.take(12)}"
+            link.paired = true // ★ 对齐 KDE Connect：配对成功直接复用当前加密链路，严禁断链重连！
             peerBook.upsert(
-                link.peerHelloDeviceId ?: "peer-${fpHex.take(12)}",
+                id,
                 link.remoteName.ifEmpty { "peer" },
                 fpHex,
                 link.remoteEndpoint,
                 markPaired = true,
             )
-            pairingMode = false
-            status("配对成功，指纹已固定")
-            link.close()
-            connect(pinned = true)
+            reconnectMachine.onConnected()
+            status("配对成功，已建立信任通道")
         } else {
-            status("配对失败：配对码不匹配")
+            status("配对失败：配对码不匹配或窗口未开")
         }
     }
 
     override fun onConnected(link: PcLink) {
         if (!links.contains(link)) links.add(link)
-        if (link.outgoing && prefs.serverFpHex != null) link.paired = true
+        if (link.outgoing) {
+            // B-7 快路径：目标端点命中已配对条目即标记 paired（onPeerHello 会按 deviceId 毫秒级兜底）
+            val t = lastTarget
+            if (t != null && peerBook.all().any { it.paired && it.endpoint == "${t.host}:${t.port}" }) link.paired = true
+            reconnectMachine.onConnected()
+        }
         status(
-            if (prefs.serverFpHex != null || link.paired) "已连接到对端，等待剪切板…"
+            if (link.paired || peerBook.all().any { it.paired }) "已连接到对端，等待剪切板…"
             else "已连接但未配对——请输入对端配对码后点「配对」"
         )
         probeClipboardPrivilege()
@@ -331,68 +396,101 @@ class SyncManager(
     override fun onDisconnected(link: PcLink) {
         links.remove(link)
         if (link.outgoing) {
-            status("连接断开，3s 后重连")
-            scheduleReconnect()
+            reconnectMachine.onDisconnected()
         } else {
             status("对端链接断开（服务端保持监听）")
         }
     }
 
-    /** BLE 自动发现 PC（D-02）：扫描广播回填 IP 后连接；BLE 不可用返回 false 走手动兜底。 */
-    fun startAutoDiscover(): Boolean {
-        status("正在通过 BLE 发现 PC…")
-        PcDiscovery.onFound = { ip, port ->
-            handler.post {
-                prefs.host = ip
-                prefs.port = port
-                status("发现 PC: $ip:$port，连接中…")
-                connect(pinned = prefs.serverFpHex != null)
-            }
-        }
-        val ok = PcDiscovery.start(prefs.serverFpHex) { count ->
-            status(
-                when {
-                    count < 0 -> "扫描失败（错误码 ${-count}）——检查蓝牙/定位权限"
-                    count == 0 -> "30 秒未收到任何 BLE 广播——确认两端蓝牙已开启、PC 应用正在运行"
-                    else -> "扫到 $count 条广播但无 ClipPort 匹配——查看 PC 日志「BLE 广播状态」"
-                }
-            )
-        }
-        if (!ok) status("BLE 不可用（权限/硬件），请手动填写 IP")
-        return ok
-    }
+    /** 解析对目标端点的 TLS Pin 指纹（仅取 64 hex 完整值）。无则 trustAny，由 HELLO/PAIR 应用层判定身份。 */
+    private fun pinnedFpHexFor(host: String, port: Int): String? =
+        peerBook.all().firstOrNull {
+            it.endpoint == "$host:$port" && it.certFpHex?.length == 64
+        }?.certFpHex
 
-    /** 连接对端。pinned=true 用已固定指纹；pairingMode=true 附带配对请求。 */
-    fun connect(pinned: Boolean): PcLink? {
-        val host = prefs.host
-        if (host.isNullOrEmpty()) return null
+    /**
+     * 建连统一入口（B-6，纯对等模式）。
+     * @param pinnedFpHex 对端固定指纹；null = 未知对端（TLS trustAny，身份由 HELLO/PAIR 应用层判定）
+     * @param code        非空表示发起配对挑战（PAIR_REQ）
+     */
+    fun connectTo(host: String, port: Int, pinnedFpHex: String? = null, code: String? = null): PcLink? {
         handler.post {
+            // 防平行链路：同主机已有存活链接时不再重复建连（配对模式除外），并视作重连目标已达成
+            if (code == null && links.any { it.alive }) {
+                Log.d(TAG, "connectTo skipped: alive link already exists to $host:$port")
+                reconnectMachine.onConnected()
+                return@post
+            }
             try {
+                // 配对模式：清理已有未配对的死链接/闲置链接，避免平行链路导致状态混乱与二次建连被屏蔽
+                if (code != null) {
+                    val stale = links.filter { it.alive && !it.paired }
+                    stale.forEach { it.close() }
+                    links.removeAll(stale)
+                }
+                lastTarget = AutoTarget("", host, port)
                 val self = selfHello()
-                val isPairing = pairingMode || !pinned || prefs.serverFpHex == null
                 val l = PcLink.client(
-                    host, prefs.port,
-                    pinnedFp = prefs.serverFpHex?.hexToBytes(),
-                    trustAny = isPairing,
+                    host, port,
+                    pinnedFp = pinnedFpHex?.hexToBytes(),
+                    trustAny = pinnedFpHex == null,
                     self = self,
                     ownFp = PeerIdentity.fingerprint(context),
                     listener = this,
                     onStep = { step -> status(step) },
                 )
                 links.add(l)
-                if (pairingMode) {
+                if (code != null) {
                     val codeHash = MessageDigest.getInstance("SHA-256")
-                        .digest("clipport:${prefs.pairingCode}".toByteArray(Charsets.UTF_8))
+                        .digest("clipport:$code".toByteArray(Charsets.UTF_8))
                     l.send(FrameCodec.PAIR_REQ, seqCounter.incrementAndGet(),
                         Pairing.encodePairReq(codeHash, PeerIdentity.fingerprint(context)))
+                    status("已发送配对请求至 $host:$port，等待确认…")
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "connect failed", e)
                 status("连接失败：${e.message}")
-                scheduleReconnect()
+                reconnectMachine.onConnectFailed(e.message)
             }
         }
         return null
+    }
+
+    /** 对指定对端发起配对挑战（若已有存活链路直接复用发送 PAIR_REQ，避免新建平行链路）。 */
+    fun requestPair(host: String, port: Int, code: String) {
+        handler.post {
+            startPairingMode()
+            val existing = links.firstOrNull { it.alive && (it.remoteEndpoint == "$host:$port" || it.remoteEndpoint.startsWith("$host:")) }
+            if (existing != null) {
+                // 已有链路：直接复用此链路发送 PAIR_REQ，零延迟、无平行链路！
+                val codeHash = MessageDigest.getInstance("SHA-256")
+                    .digest("clipport:$code".toByteArray(Charsets.UTF_8))
+                existing.send(FrameCodec.PAIR_REQ, seqCounter.incrementAndGet(),
+                    Pairing.encodePairReq(codeHash, PeerIdentity.fingerprint(context)))
+                status("正在通过当前链路向 $host:$port 发起配对…")
+            } else {
+                connectTo(host, port, pinnedFpHex = null, code = code)
+            }
+        }
+    }
+
+    /** 手动/启动路径：连接手动目标（UI 维护的 manualHost/manualPort），按端点回查指纹。 */
+    fun connectManual(): PcLink? {
+        val host = prefs.manualHost ?: return null
+        return connectTo(host, prefs.manualPort, pinnedFpHex = pinnedFpHexFor(host, prefs.manualPort))
+    }
+
+    /** 启动时对对端库中所有已配对端点发起重连（仲裁：仅本端 deviceId 较小时连出，与 PC 端对称）。 */
+    fun reconnectKnownPeers() {
+        val myId = prefs.deviceIdBytes().joinToString("") { b -> "%02x".format(b) }
+        for (p in peerBook.all()) {
+            if (!p.paired) continue
+            if (myId <= p.deviceId) continue
+            val ep = p.endpoint?.split(":") ?: continue
+            if (ep.size != 2) continue
+            val port = ep[1].toIntOrNull() ?: continue
+            connectTo(ep[0], port, pinnedFpHex = p.certFpHex?.takeIf { it.length == 64 })
+        }
     }
 
     private fun selfHello() = Hello().apply {
@@ -402,21 +500,71 @@ class SyncManager(
         deviceId = prefs.deviceIdBytes()
     }
 
-    private var reconnectScheduled = false
-    private fun scheduleReconnect() {
-        if (reconnectScheduled) return
-        reconnectScheduled = true
-        handler.postDelayed({ reconnectScheduled = false; connect(pinned = prefs.serverFpHex != null) }, 3000)
-    }
-
     fun disconnect() {
         com.clipport.app.xposed.FloatingClipboardBridge.unregister()
+        reconnectMachine.reset()
         links.forEach { it.close() }
         links.clear()
+        incomingFileStreams.values.forEach { runCatching { it.close() } }
+        incomingFileStreams.clear()
         peerServer?.stop()
         peerServer = null
         LanDiscovery.stop()
         udpDiscoveryStarted = false
+    }
+
+    @Volatile private var lastAnnounceAt = 0L
+
+    /** 网络可用/切换（D-31=A）：WiFi 或热点接入时即刻宣告并唤醒重连（广播 2s 节流，capabilities 变化会频繁回调） */
+    fun onNetworkAvailable(isWifi: Boolean) {
+        handler.post {
+            status(if (isWifi) "WiFi 已连接，刷新在线宣告并唤醒重连…" else "网络已切换，刷新在线宣告…")
+            val now = System.currentTimeMillis()
+            if (now - lastAnnounceAt > 2_000) {
+                lastAnnounceAt = now
+                LanDiscovery.broadcastNow()
+            }
+            if (links.none { it.alive }) {
+                reconnectMachine.wakeUp("network_available")
+            }
+        }
+    }
+
+    /** 网络断开：仅当设备彻底离线时才清理连接与未完成流（D-33=A）。
+     *  registerDefaultNetworkCallback 跟踪的是"默认网络"——手机连上 WiFi 后系统切换默认网络
+     *  （蜂窝→WiFi）会补发 onLost(蜂窝)，此时 TCP 链路所在的 WiFi 仍健康，绝不能误杀（参考 KDE Connect：
+     *  链路生命周期由 TCP 自身状态管理，单网卡丢失不等于断链）。 */
+    fun onNetworkLost() {
+        handler.post {
+            val cmSys = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val stillOnline = cmSys.allNetworks.any { n ->
+                val caps = cmSys.getNetworkCapabilities(n)
+                caps != null && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            }
+            if (stillOnline) {
+                Log.d(TAG, "network lost but device still online, keep links")
+                return@post
+            }
+            status("网络已离线，关闭全部连接")
+            links.forEach { it.close() }
+            links.clear()
+            incomingFileStreams.values.forEach { runCatching { it.close() } }
+            incomingFileStreams.clear()
+        }
+    }
+
+    private val pairingTimeoutRunnable = Runnable {
+        if (pairingMode) {
+            pairingMode = false
+            status("配对模式已超时退出")
+        }
+    }
+
+    /** 进入配对模式（对齐 KDE Connect PairingHandler：30s 超时自动回到 NotPaired 终态，杜绝粘滞 Requested 态）。 */
+    fun startPairingMode() {
+        pairingMode = true
+        handler.removeCallbacks(pairingTimeoutRunnable)
+        handler.postDelayed(pairingTimeoutRunnable, 30_000)
     }
 
     /** 开启配对窗口（本端作为服务端被连方）。返回 6 位码。 */
@@ -443,7 +591,7 @@ class SyncManager(
             name = android.os.Build.MODEL,
             type = 1,
             port = PeerServer.DEFAULT_PORT,
-            fpHex = fpHex.take(16),
+            fpHex = fpHex,   // B-10：广播完整 64 位指纹（对端库可 pinned 校验，UDP 包仍 <300B）
             announced = { dId, name, type, port, fp, ip ->
                 handler.post { handleAnnounced(dId, name, type, port, fp, ip) }
             },
@@ -453,7 +601,7 @@ class SyncManager(
 
     private fun handleAnnounced(dId: String, name: String, type: Int, port: Int, fp: String, ip: String) {
         try {
-            val peer = peerBook.upsert(dId, name, fp.take(16).ifEmpty { null }, "$ip:$port")
+            val peer = peerBook.upsert(dId, name, fp.ifEmpty { null }, "$ip:$port")   // B-10：完整指纹入库
             if (peer.paired) {
                 // 已配对：自动建链。仲裁：仅 deviceId 较小的一方连出（防双向重复建链）
                 val myId = prefs.deviceIdBytes().joinToString("") { b -> "%02x".format(b) }
@@ -462,10 +610,10 @@ class SyncManager(
                 val last = connectAttempts[dId]
                 if (last != null && System.currentTimeMillis() - last < 15_000) return
                 connectAttempts[dId] = System.currentTimeMillis()
-                status("自动连接已配对设备 $name ($ip:$port)")
-                prefs.host = ip
-                prefs.port = port
-                connect(pinned = true)
+                status("发现已配对设备 $name ($ip:$port)，唤醒连接…")
+                // B-6：自动目标与手动目标解耦，不再覆盖 prefs.manualHost/manualPort
+                autoConnectTarget = AutoTarget(dId, ip, port)
+                reconnectMachine.wakeUp("udp_announced")
             } else {
                 status("发现未配对设备 $name ($ip:$port)——开启对端配对窗口后输码连接")
             }
@@ -512,6 +660,10 @@ class SyncManager(
                 incomingFileStreams.remove(chunk.fileName)?.runCatching { close() }
             }
         }
+    }
+
+    override fun onCancel(link: PcLink, seq: Long) {
+        Log.i(TAG, "received cancel frame from ${link.remoteName} for seq $seq")
     }
 
     /** 发送本地文件至在线设备 */
@@ -567,15 +719,14 @@ class SyncManager(
 class Prefs(context: Context) {
     private val sp = context.getSharedPreferences("clipport", Context.MODE_PRIVATE)
 
-    var host: String?
-        get() = sp.getString("host", null)
-        set(v) = sp.edit().putString("host", v).apply()
-    var port: Int
-        get() = sp.getInt("port", 47190)
-        set(v) = sp.edit().putInt("port", v).apply()
-    var serverFpHex: String?
-        get() = sp.getString("server_fp", null)
-        set(v) = sp.edit().putString("server_fp", v).apply()
+    /// B-6/U-4：仅作为"手动连接目标"由 UI 维护；自动发现目标走 autoConnectTarget，不写这里。
+    var manualHost: String?
+        get() = sp.getString("manual_host", null)
+        set(v) = sp.edit().putString("manual_host", v).apply()
+    var manualPort: Int
+        get() = sp.getInt("manual_port", 47190)
+        set(v) = sp.edit().putInt("manual_port", v).apply()
+
     var pairingCode: String
         get() = sp.getString("pairing_code", "") ?: ""
         set(v) = sp.edit().putString("pairing_code", v).apply()

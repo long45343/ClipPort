@@ -12,6 +12,8 @@ namespace ClipPort.Core.Sync;
 public sealed class SyncEngine : IDisposable
 {
     public const int LazyThresholdBytes = 16 * 1024; // D-05
+    /// <summary>防改写过滤窗口（D-07-B）：发布后该窗口内内容完全一致的再次回调视为本地剪贴板管理器改写。</summary>
+    public const int LocalRewriteGuardMs = 3000;
 
     private readonly AppConfig _cfg;
     private readonly TlsLinkServer _server;
@@ -27,11 +29,12 @@ public sealed class SyncEngine : IDisposable
     private ClipboardSnapshot? _lastRemote;     // 回声比对窗（1.5s）
     private DateTime _lastRemoteAt = DateTime.MinValue;
     private readonly ScreenGate _screenGate = new();
-    public Net.PeerStore Peers { get; } = Net.PeerStore.Load();
+    public Net.PeerStore Peers { get; }
     public FileShareManager FileShare { get; }
     /// <summary>本端证书指纹提供者（SHA256(DER)，App 注入）。</summary>
     public Func<byte[]?>? OwnFpProvider { get; set; }
     private Net.UdpDiscovery? _udp;
+    private Net.NetworkWatcher? _networkWatcher;
     private readonly Dictionary<string, DateTime> _connectAttempts = new();   // deviceId → 上次尝试时间
     private ClipboardSnapshot? _lockedPending;  // D-16：锁屏缓存（仅最新一条），解锁补写
 
@@ -42,6 +45,7 @@ public sealed class SyncEngine : IDisposable
     {
         _cfg = cfg;
         _server = server;
+        Peers = Net.PeerStore.Load();
         FileShare = new FileShareManager(msg => Log?.Invoke(msg));
         _server.OnBroadcast = OnBroadcastFrame;
         _server.OnTextRequest = OnTextRequest;
@@ -50,7 +54,14 @@ public sealed class SyncEngine : IDisposable
         _server.OnPairOk = OnPairOkResult;
         _server.OwnHelloProvider = OwnHello;
         _server.OnFileShareChunk = chunk => FileShare.HandleIncomingChunk(chunk);
+        _server.OnCancel = (link, seq) => Log?.Invoke($"对端 {link.PeerHello?.Name} 取消了请求 seq={seq}");
         StartUdpDiscovery();
+        _networkWatcher = new Net.NetworkWatcher(() =>
+        {
+            Log?.Invoke("网络状态发生变化，500ms 防抖完成，即刻广播最新地址宣告 (D-32=A)");
+            _udp?.BroadcastNow();
+        }, debounceMs: 500);
+        _networkWatcher.Start();
         _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "clipport-sync" };
         _worker.Start();
         _screenGate.Unlocked += () => _queue.TryAdd(() =>
@@ -85,6 +96,13 @@ public sealed class SyncEngine : IDisposable
         // 防回环第2道：1.5s 内与刚写入的远端内容一致 → 回声
         if (_lastRemote is not null && DateTime.UtcNow - _lastRemoteAt < TimeSpan.FromMilliseconds(1500)
             && SameText(snap, _lastRemote)) return;
+        // 防改写第3道（D-07-B"内容没变不重发"）：3s 内与刚发布内容完全一致 = 本地剪贴板管理器改写，跳过
+        if (_lastLocal is not null && DateTime.UtcNow - _lastLocalAt < TimeSpan.FromMilliseconds(LocalRewriteGuardMs)
+            && snap.ContentEquals(_lastLocal))
+        {
+            Log?.Invoke("skip publish: identical to last local within 3s (local rewrite)");
+            return;
+        }
 
         var seq = (uint)Interlocked.Increment(ref _selfSeq) - 1;
         bool needChannel = EstimateSize(snap) > LazyThresholdBytes;
@@ -127,17 +145,22 @@ public sealed class SyncEngine : IDisposable
         };
     }
 
-    // ---- 远端广播 → 接收（spec §2.2 / D-14=B 预下载）----
-    private void OnBroadcastFrame(ClipBroadcast bc)
+    // ---- 远端广播 → 接收（spec §2.2 / D-14=B 预下载；B-3：携带来源链路供内容回源）----
+    private void OnBroadcastFrame(Net.TlsLinkServer.PhoneLink source, ClipBroadcast bc)
     {
         _queue.TryAdd(() =>
         {
-            try { HandleRemote(bc); }
+            try { HandleRemote(source, bc); }
             catch (Exception ex) { Log?.Invoke("remote clip error: " + ex.Message); }
         });
     }
 
-    private void HandleRemote(ClipBroadcast bc)
+    /// <summary>内容源选择（B-3 多源内容服务）：广播来源链路优先（该对端即内容持有者），失联回退任一存活链路。</summary>
+    private Net.TlsLinkServer.PhoneLink? SelectContentLink(Net.TlsLinkServer.PhoneLink? source) =>
+        source is { Alive: true, Paired: true } ? source
+        : _server.LinksSnapshot().FirstOrDefault(l => l.Alive && l.Paired);
+
+    private void HandleRemote(Net.TlsLinkServer.PhoneLink source, ClipBroadcast bc)
     {
         if (!_cfg.SyncEnabled) return;
         var devId = Convert.ToHexString(bc.DeviceId);
@@ -152,8 +175,8 @@ public sealed class SyncEngine : IDisposable
         }
         else
         {
-            // D-14=B 首版：预下载（大文本/图片经 REQ_TEXT 拉取）后一次性写入
-            var link = _server.PrimaryLink;
+            // D-14=B 首版：预下载（大文本/图片经 REQ_TEXT 拉取）后一次性写入；B-3：来源链路优先回源
+            var link = SelectContentLink(source);
             if (link is not null)
             {
                 foreach (var mime in bc.MimeCodes.Distinct())
@@ -222,7 +245,7 @@ public sealed class SyncEngine : IDisposable
                     trustAny = pinned is null;
                 }
                 var link = await _server.ConnectOutAsync(host, port, pinned, trustAny, _cts.Token);
-                Peers.Upsert("", "", null, $"{host}:{port}");  // 仅刷新端点占位；正式登记在 HELLO/PAIR 后
+                // B-4：不再写空 DeviceId 占位条目——端点由 HandleAnnounced 归一化登记，身份在 HELLO/PAIR 后落库
                 if (!string.IsNullOrEmpty(code))
                 {
                     var hash = AppConfig.CodeHash(code);
@@ -257,16 +280,21 @@ public sealed class SyncEngine : IDisposable
     {
         try
         {
+            // 仲裁用原始小写 id（与本端 Guid "N" 小写自增一致，避免大小写 Ordinal 偏斜）
+            var arbiterId = id;
+            // UDP JSON 中的 id 为小写 hex（Android 端 "%02x"），PeerStore 为大写——统一归一化再比对
+            id = id.ToUpperInvariant();
             var knownFp = Peers.FingerprintOf(id);
-            var paired = knownFp is not null || _cfg.PairedPhoneId == id;
-            Peers.Upsert(id, name, fp.Length >= 16 ? fp : knownFp, $"{ip}:{port}");
+            var paired = Peers.Find(id)?.Paired == true;   // B-2：配对事实源 = PeerStore.Paired
+            // B-10 指纹只增不减：完整指纹（64 hex）才覆盖，UDP 广播中的短/截断指纹不污染库
+            Peers.Upsert(id, name, fp.Length >= 64 ? fp : knownFp, $"{ip}:{port}");
             if (!paired)
             {
                 Log?.Invoke($"发现未配对设备 {name} ({ip}:{port})——配对后才可同步");
                 return;
             }
             // 已配对：自动建链。确定性仲裁：仅 deviceId 较小的一方主动连出，避免双向重复建链
-            if (string.CompareOrdinal(_cfg.DeviceId, id) > 0) return;
+            if (string.CompareOrdinal(_cfg.DeviceId, arbiterId) > 0) return;
             if (_server.HasAliveLinkTo(id)) return;
             if (_connectAttempts.TryGetValue(id, out var last) && DateTime.UtcNow - last < TimeSpan.FromSeconds(15)) return;
             _connectAttempts[id] = DateTime.UtcNow;
@@ -277,11 +305,15 @@ public sealed class SyncEngine : IDisposable
         catch (Exception ex) { Log?.Invoke("announce handle error: " + ex.Message); }
     }
 
-    /// <summary>启动时对已知端点的对端发起重连（二期自动组网的第一步）。</summary>
+    /// <summary>启动时对已知端点的对端发起重连（二期自动组网的第一步）。
+    /// 仲裁与 HandleAnnounced 一致：仅 deviceId 较小的一方连出，避免两端启动互拨产生双向重复链路。</summary>
     public void ReconnectKnownPeers()
     {
         foreach (var p in Peers.Peers.Where(p => !string.IsNullOrEmpty(p.LastEndpoint)).ToList())
         {
+            if (!p.Paired) continue;
+            // PeerStore 键为大写 hex，本端 DeviceId 为小写 Guid——归一化后再做字典序仲裁
+            if (string.CompareOrdinal(_cfg.DeviceId, p.DeviceId.ToLowerInvariant()) > 0) continue;
             var ep = p.LastEndpoint!.Split(':');
             if (ep.Length == 2 && int.TryParse(ep[1], out var port))
                 ConnectPeer(ep[0], port, null);
@@ -319,11 +351,11 @@ public sealed class SyncEngine : IDisposable
 
     private bool OnPairRequest(Net.TlsLinkServer.PhoneLink link, byte[] codeHash, byte[]? joinerFp)
     {
-        // 幂等：已配对设备再次发起配对（重装/换码后重试）直接放行
+        // 幂等：已配对设备再次发起配对（重装/换码后重试）直接放行（B-2：判定走 PeerStore.Paired）
         var helloId = Convert.ToHexString(link.PeerHello.DeviceId);
-        if (!string.IsNullOrEmpty(_cfg.PairedPhoneId) &&
-            string.Equals(_cfg.PairedPhoneId, helloId, StringComparison.OrdinalIgnoreCase))
+        if (Peers.Find(helloId)?.Paired == true)
         {
+            Log?.Invoke($"对端 {link.PeerHello.Name} 已是已配对设备，幂等放行");
             StatusChanged?.Invoke("paired (idempotent)");
             return true;
         }
@@ -338,21 +370,20 @@ public sealed class SyncEngine : IDisposable
             return false;
         }
         _cfg.PairingOpen = false;
-        _cfg.PairedPhoneId = Convert.ToHexString(link.PeerHello.DeviceId);
-        // 二期: 登记对端（含加入方证书指纹，用于本端连出时校验）
+        // 二期: 登记对端（含加入方证书指纹，用于本端连出时校验）；markPaired = 配对事实源
         var jfp = joinerFp is { Length: > 0 } ? Convert.ToHexString(joinerFp) : null;
-        Peers.Upsert(Convert.ToHexString(link.PeerHello.DeviceId), link.PeerHello.Name, jfp, null);
+        Peers.Upsert(helloId, link.PeerHello.Name, jfp, null, markPaired: true);
         Peers.Save();
+        Log?.Invoke($"对端 {link.PeerHello.Name} ({helloId[..Math.Min(8, helloId.Length)]}…) 配对成功！");
         StatusChanged?.Invoke("paired");
         return true;
     }
 
-    /// <summary>对端 HELLO：恢复 Paired 态 + 对端库登记（二期对等模式）。</summary>
+    /// <summary>对端 HELLO：恢复 Paired 态 + 对端库登记（B-2：PeerStore 为唯一事实源，含历史指纹兜底）。</summary>
     private void OnPhoneHello(Net.TlsLinkServer.PhoneLink link, Hello hello)
     {
         var id = Convert.ToHexString(hello.DeviceId);
-        if (!string.IsNullOrEmpty(_cfg.PairedPhoneId) &&
-            string.Equals(_cfg.PairedPhoneId, id, StringComparison.OrdinalIgnoreCase))
+        if (Peers.Find(id)?.Paired == true)
         {
             link.Paired = true;
             Log?.Invoke($"paired peer reconnected: {hello.Name}");
@@ -378,7 +409,8 @@ public sealed class SyncEngine : IDisposable
         Peers.Upsert(id,
             string.IsNullOrEmpty(peerName) ? link.PeerHello.Name : peerName,
             peerFp is { Length: > 0 } ? Convert.ToHexString(peerFp) : null,
-            link.RemoteEndpointText);
+            link.RemoteEndpointText,
+            markPaired: true);
         Peers.Save();
         Log?.Invoke($"已加入对端: {peerName} ({id[..12]}…)");
         StatusChanged?.Invoke("paired");
@@ -394,6 +426,9 @@ public sealed class SyncEngine : IDisposable
 
     public void Dispose()
     {
+        _networkWatcher?.Dispose();
+        _udp?.Dispose();
+        FileShare.Reset();
         _cts.Cancel();
         _queue.CompleteAdding();
     }
